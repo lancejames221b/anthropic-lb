@@ -56,13 +56,23 @@ from collections import defaultdict
 
 from aiohttp import web, ClientSession, ClientTimeout
 
+# ---------------------------------------------------------------------------
+# Optional Presidio + spaCy NER (Phase 2) — graceful import
+# ---------------------------------------------------------------------------
+try:
+    from presidio_analyzer import AnalyzerEngine, RecognizerResult
+    from presidio_analyzer.nlp_engine import NlpEngineProvider
+    PRESIDIO_AVAILABLE = True
+except ImportError:
+    PRESIDIO_AVAILABLE = False
+
 PORT = int(os.environ.get("ANTHROPIC_LB_PORT", "8891"))
 UPSTREAM = os.environ.get("ANTHROPIC_LB_UPSTREAM", "https://api.anthropic.com")
 KEYS_FILE = os.environ.get("ANTHROPIC_LB_KEYS", "./keys.json")
 STRATEGY = os.environ.get("ANTHROPIC_LB_STRATEGY", "least-loaded")
 
 # PII configuration
-PII_MODE = os.environ.get("ANTHROPIC_LB_PII", "off").lower()          # regex | off
+PII_MODE = os.environ.get("ANTHROPIC_LB_PII", "off").lower()          # regex | presidio | off
 PII_RESPONSE = os.environ.get("ANTHROPIC_LB_PII_RESPONSE", "detokenize").lower()  # detokenize | off
 PII_PATTERNS_FILE = os.environ.get("ANTHROPIC_LB_PII_PATTERNS", "./patterns.json")
 
@@ -245,10 +255,99 @@ _CUSTOM_PATTERN_MTIME = 0.0
 _CUSTOM_PATTERNS = []
 
 
+# ---------------------------------------------------------------------------
+# PresidioDetector — lazy-initialized NER engine (only used in presidio mode)
+# ---------------------------------------------------------------------------
+
+class PresidioDetector:
+    """
+    Wraps presidio-analyzer with a spaCy en_core_web_lg NLP engine.
+    Lazy-initialised on first call so import-time cost is zero.
+    """
+
+    # Entity types to detect via NER (structured PII is handled by regex)
+    ENTITY_TYPES = [
+        "PERSON",
+        "ORGANIZATION",
+        "LOCATION",
+        "DATE_TIME",
+        "NRP",             # Nationality / Religious / Political group
+        "MEDICAL_LICENSE",
+    ]
+
+    def __init__(self):
+        self._engine = None
+
+    def _init_engine(self):
+        """Build the AnalyzerEngine with spaCy NLP backend (called once)."""
+        global PRESIDIO_AVAILABLE
+        try:
+            configuration = {
+                "nlp_engine_name": "spacy",
+                "models": [{"lang_code": "en", "model_name": "en_core_web_lg"}],
+            }
+            provider = NlpEngineProvider(nlp_configuration=configuration)
+            nlp_engine = provider.create_engine()
+            self._engine = AnalyzerEngine(
+                nlp_engine=nlp_engine,
+                supported_languages=["en"],
+            )
+        except OSError as e:
+            # Typically: spaCy model not installed
+            print(
+                f"[pii] WARNING: presidio/spaCy init failed — {e}\n"
+                "  Install the model with: python -m spacy download en_core_web_lg\n"
+                "  Falling back to regex-only redaction.",
+                file=sys.stderr,
+            )
+            PRESIDIO_AVAILABLE = False
+            self._engine = None
+        except Exception as e:
+            print(
+                f"[pii] WARNING: presidio init failed — {e}. Falling back to regex-only.",
+                file=sys.stderr,
+            )
+            PRESIDIO_AVAILABLE = False
+            self._engine = None
+
+    def detect(self, text: str) -> list:
+        """
+        Run NER on *text* and return a list of
+        (entity_type: str, start: int, end: int, matched_text: str) tuples.
+        Returns [] if the engine is unavailable or text is empty.
+        """
+        global PRESIDIO_AVAILABLE
+        if not PRESIDIO_AVAILABLE:
+            return []
+        if not text or not text.strip():
+            return []
+        if self._engine is None:
+            self._init_engine()
+        if self._engine is None:
+            return []
+        try:
+            results = self._engine.analyze(
+                text=text,
+                entities=self.ENTITY_TYPES,
+                language="en",
+            )
+            return [
+                (r.entity_type, r.start, r.end, text[r.start:r.end])
+                for r in results
+            ]
+        except Exception as e:
+            print(f"[pii] presidio analyze error: {e}", file=sys.stderr)
+            return []
+
+
+# Module-level singleton — shared across all requests
+_PRESIDIO_DETECTOR = PresidioDetector()
+
+
 def _get_all_patterns():
     """Return builtin patterns + hot-reloaded custom patterns."""
     global _CUSTOM_PATTERN_MTIME, _CUSTOM_PATTERNS
-    if PII_MODE == "regex" and os.path.exists(PII_PATTERNS_FILE):
+    if PII_MODE in ("regex", "presidio") and os.path.exists(PII_PATTERNS_FILE):
         try:
             mtime = os.path.getmtime(PII_PATTERNS_FILE)
             if mtime != _CUSTOM_PATTERN_MTIME:
@@ -309,21 +408,66 @@ class PIIVault:
 
 def _redact_text(text: str, vault: PIIVault, patterns) -> str:
     """
-    Run all PII patterns against `text` and replace matches with vault tokens.
-    Patterns are applied in order; earlier patterns take priority.
+    Run all PII patterns (and optionally Presidio NER) against `text` and
+    replace matches with vault tokens.
+
+    Strategy (Option A — operate on original text throughout):
+    1. Collect all regex matches (start, end, type, value) from original text.
+    2. If PII_MODE=="presidio", collect NER matches from original text.
+    3. Filter NER matches that overlap with any regex match (no double-tokenisation).
+    4. Merge all matches, sort descending by start position.
+    5. Apply right-to-left so earlier positions stay valid.
     """
+    if not text:
+        return text
+
+    # ------------------------------------------------------------------
+    # Step 1: Collect regex matches on the original text
+    # ------------------------------------------------------------------
+    regex_matches = []  # list of (start, end, pii_type, original_value)
     for name, regex, pii_type, validator in patterns:
-        def replace_match(m):
+        for m in regex.finditer(text):
             full = m.group(0)
-            # For patterns with a capturing group (e.g. Bearer token body)
-            # we tokenize the full match so context is preserved
             if validator is not None:
-                # Strip non-digits for validation (credit cards)
                 digits_only = re.sub(r'\D', '', full)
                 if not validator(digits_only):
-                    return full
-            return vault.tokenize(full, pii_type)
-        text = regex.sub(replace_match, text)
+                    continue
+            regex_matches.append((m.start(), m.end(), pii_type, full))
+
+    # Build a list of (start, end) spans already covered by regex so we can
+    # quickly test overlap below.
+    regex_spans = [(s, e) for s, e, _, _ in regex_matches]
+
+    def _overlaps(start: int, end: int) -> bool:
+        """Return True if (start, end) overlaps with any regex span."""
+        for rs, re_ in regex_spans:
+            if start < re_ and end > rs:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Step 2+3: Collect Presidio NER matches (presidio mode only)
+    # ------------------------------------------------------------------
+    ner_matches = []
+    if PII_MODE == "presidio" and PRESIDIO_AVAILABLE:
+        for entity_type, start, end, matched_text in _PRESIDIO_DETECTOR.detect(text):
+            if not _overlaps(start, end):
+                ner_matches.append((start, end, entity_type, matched_text))
+
+    # ------------------------------------------------------------------
+    # Step 4: Merge and sort descending (right-to-left application)
+    # ------------------------------------------------------------------
+    all_matches = regex_matches + ner_matches
+    # Sort by start position DESCENDING so we can safely replace right→left
+    all_matches.sort(key=lambda x: x[0], reverse=True)
+
+    # ------------------------------------------------------------------
+    # Step 5: Apply replacements right-to-left
+    # ------------------------------------------------------------------
+    for start, end, pii_type, original_value in all_matches:
+        token = vault.tokenize(original_value, pii_type)
+        text = text[:start] + token + text[end:]
+
     return text
 
 
@@ -361,7 +505,7 @@ def redact_request_body(body_bytes: bytes, vault: PIIVault) -> bytes:
     tokenize PII in-place, and return the re-serialized body.
     Returns original bytes unchanged if body is not valid JSON.
     """
-    if PII_MODE != "regex":
+    if PII_MODE not in ("regex", "presidio"):
         return body_bytes
 
     try:
@@ -614,7 +758,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     # PII Redaction — tokenize PII in request body before forwarding
     # ------------------------------------------------------------------
     vault = PIIVault()
-    if PII_MODE == "regex":
+    if PII_MODE in ("regex", "presidio"):
         body = redact_request_body(body, vault)
     # ------------------------------------------------------------------
 
@@ -771,6 +915,7 @@ async def status_handler(request: web.Request) -> web.Response:
         # PII statistics (always included; zeroes when PII_MODE=off)
         "pii": {
             "mode": PII_MODE,
+            "presidio_available": PRESIDIO_AVAILABLE if PII_MODE == "presidio" else None,
             "response_mode": PII_RESPONSE,
             "total_redacted": PII_GLOBAL_STATS["total_redacted"],
             "by_type": dict(PII_GLOBAL_STATS["by_type"]),
@@ -801,5 +946,17 @@ if __name__ == "__main__":
     print(f"  accounts: {', '.join(KEY_NAMES)} ({len(KEYS)} keys)")
     print(f"  upstream: {UPSTREAM}")
     print(f"  strategy: {STRATEGY}")
-    print(f"  pii mode: {PII_MODE}" + (f" (patterns: {PII_PATTERNS_FILE})" if PII_MODE != "off" else ""))
+    if PII_MODE == "presidio":
+        if PRESIDIO_AVAILABLE:
+            print(f"  pii mode: presidio (presidio: available, spacy model: en_core_web_lg)")
+        else:
+            print(
+                f"  pii mode: presidio (WARNING: presidio not installed, falling back to regex)",
+                file=sys.stderr,
+            )
+            print(f"  pii mode: presidio (WARNING: presidio not installed, falling back to regex)")
+    elif PII_MODE != "off":
+        print(f"  pii mode: {PII_MODE} (patterns: {PII_PATTERNS_FILE})")
+    else:
+        print(f"  pii mode: {PII_MODE}")
     web.run_app(app, port=PORT, print=None)
