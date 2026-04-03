@@ -18,8 +18,8 @@ Configuration:
         ANTHROPIC_LB_STRATEGY   Routing strategy (default: least-loaded)
 
         # PII redaction (Phase 1: regex-based)
-        ANTHROPIC_LB_PII        PII mode: regex | off (default: off)
-        ANTHROPIC_LB_PII_RESPONSE  Response handling: detokenize | off (default: detokenize)
+        ANTHROPIC_LB_PII        PII mode: regex | presidio | off (default: off)
+        ANTHROPIC_LB_PII_RESPONSE  Response handling: detokenize | scan | off (default: detokenize)
         ANTHROPIC_LB_PII_PATTERNS  Path to custom patterns JSON (default: ./patterns.json)
 
     keys.json format:
@@ -73,7 +73,7 @@ STRATEGY = os.environ.get("ANTHROPIC_LB_STRATEGY", "least-loaded")
 
 # PII configuration
 PII_MODE = os.environ.get("ANTHROPIC_LB_PII", "off").lower()          # regex | presidio | off
-PII_RESPONSE = os.environ.get("ANTHROPIC_LB_PII_RESPONSE", "detokenize").lower()  # detokenize | off
+PII_RESPONSE = os.environ.get("ANTHROPIC_LB_PII_RESPONSE", "detokenize").lower()  # detokenize | scan | off
 PII_PATTERNS_FILE = os.environ.get("ANTHROPIC_LB_PII_PATTERNS", "./patterns.json")
 
 
@@ -85,6 +85,8 @@ PII_PATTERNS_FILE = os.environ.get("ANTHROPIC_LB_PII_PATTERNS", "./patterns.json
 PII_GLOBAL_STATS = {
     "total_redacted": 0,
     "by_type": defaultdict(int),
+    "response_redacted": 0,
+    "response_by_type": defaultdict(int),
 }
 
 
@@ -499,6 +501,335 @@ def _redact_content_block(block, vault: PIIVault, patterns):
     return block
 
 
+# ---------------------------------------------------------------------------
+# Response-side PII scanning (Phase 3)
+# ---------------------------------------------------------------------------
+
+def _redact_for_response(text: str) -> tuple:
+    """
+    Scan text for PII and replace with [REDACTED_TYPE] placeholders.
+    Uses non-reversible placeholders since the LLM may have hallucinated this data.
+    Returns (redacted_text, count, by_type_dict).
+    """
+    if not text:
+        return text, 0, {}
+
+    patterns = _get_all_patterns()
+    count = 0
+    by_type: dict = defaultdict(int)
+
+    # Collect all regex matches
+    regex_matches = []  # (start, end, pii_type, original_value)
+    for name, regex, pii_type, validator in patterns:
+        for m in regex.finditer(text):
+            full = m.group(0)
+            if validator is not None:
+                digits_only = re.sub(r'\D', '', full)
+                if not validator(digits_only):
+                    continue
+            regex_matches.append((m.start(), m.end(), pii_type, full))
+
+    # Build span coverage for overlap detection
+    regex_spans = [(s, e) for s, e, _, _ in regex_matches]
+
+    def _overlaps_resp(start: int, end: int) -> bool:
+        for rs, re_ in regex_spans:
+            if start < re_ and end > rs:
+                return True
+        return False
+
+    # Presidio NER matches (presidio mode only)
+    ner_matches = []
+    if PII_MODE == "presidio" and PRESIDIO_AVAILABLE:
+        for entity_type, start, end, matched_text in _PRESIDIO_DETECTOR.detect(text):
+            if not _overlaps_resp(start, end):
+                ner_matches.append((start, end, entity_type, matched_text))
+
+    # Merge, deduplicate overlapping spans, sort descending
+    all_matches = regex_matches + ner_matches
+    # Remove overlapping spans (keep leftmost of each overlapping group)
+    all_matches_sorted_asc = sorted(all_matches, key=lambda x: x[0])
+    deduped = []
+    last_end = -1
+    for match in all_matches_sorted_asc:
+        start, end, pii_type, original_value = match
+        if start >= last_end:
+            deduped.append(match)
+            last_end = end
+
+    # Apply right-to-left replacements
+    deduped.sort(key=lambda x: x[0], reverse=True)
+    for start, end, pii_type, original_value in deduped:
+        placeholder = f"[REDACTED_{pii_type}]"
+        text = text[:start] + placeholder + text[end:]
+        count += 1
+        by_type[pii_type] += 1
+
+    return text, count, dict(by_type)
+
+
+def _scan_response_body(response_body: bytes, vault: PIIVault) -> tuple:
+    """
+    For non-streaming responses with PII_RESPONSE=scan:
+    1. Detokenize known vault tokens from the request
+    2. Scan text content blocks for new PII the LLM may have generated
+    Returns (response_body_bytes, response_redaction_count).
+    """
+    # First: detokenize vault tokens if any
+    if vault.count > 0:
+        response_body = vault.detokenize_bytes(response_body)
+
+    # Parse response JSON and walk content blocks
+    try:
+        data = json.loads(response_body)
+    except (json.JSONDecodeError, ValueError):
+        return response_body
+
+    total_count = 0
+    total_by_type: dict = defaultdict(int)
+    modified = False
+
+    content_blocks = data.get("content", [])
+    if isinstance(content_blocks, list):
+        for block in content_blocks:
+            if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
+                original_text = block["text"]
+                scanned_text, count, by_type = _redact_for_response(original_text)
+                if count > 0:
+                    block["text"] = scanned_text
+                    total_count += count
+                    for pii_type, cnt in by_type.items():
+                        total_by_type[pii_type] += cnt
+                    modified = True
+
+    if total_count > 0:
+        PII_GLOBAL_STATS["response_redacted"] += total_count
+        for pii_type, cnt in total_by_type.items():
+            PII_GLOBAL_STATS["response_by_type"][pii_type] += cnt
+
+    if modified:
+        return json.dumps(data).encode(), total_count
+    return response_body, total_count
+
+
+# ---------------------------------------------------------------------------
+# ResponsePIIScanner -- SSE streaming response scanner (Phase 3)
+# ---------------------------------------------------------------------------
+
+class ResponsePIIScanner:
+    """
+    Buffers SSE text deltas and scans for PII before flushing to client.
+
+    Sliding-window approach:
+    - Accumulates text from content_block_delta (text_delta) events
+    - Flushes at sentence boundaries (.!? followed by space) or at 500 chars
+    - Passes all non-text-delta events through unchanged
+    - On content_block_stop: flushes remaining buffer, then passes stop event
+    """
+
+    FORCE_FLUSH_SIZE = 500  # force-flush threshold in characters
+    # Safe flush: sentence-ending punctuation followed by a space
+    _SAFE_FLUSH_RE = re.compile(r'[.!?]\s')
+
+    def __init__(self, vault: PIIVault):
+        self.vault = vault          # for detokenizing request-side tokens first
+        self.buffer = ""            # accumulated unscanned text
+        self.response_redactions = 0
+        self._by_type: dict = defaultdict(int)
+        # Track which content_block_index we're buffering for
+        self._block_index: int = 0
+        # Partial SSE line accumulator (handles chunks that split mid-line)
+        self._partial_line = b""
+
+    def _scan_and_flush(self, text: str) -> str:
+        """
+        Detokenize vault tokens, then scan for new PII.
+        Returns the processed (safe-to-send) text.
+        """
+        # Step 1: restore any vault tokens the LLM echoed back
+        if self.vault.count > 0:
+            for token, original in self.vault._rev.items():
+                text = text.replace(token, original)
+
+        # Step 2: scan for new PII in the text
+        scanned, count, by_type = _redact_for_response(text)
+        if count > 0:
+            self.response_redactions += count
+            for pii_type, cnt in by_type.items():
+                self._by_type[pii_type] += cnt
+
+        return scanned
+
+    def _find_safe_flush_pos(self) -> int:
+        """
+        Find the last sentence-end position in the buffer that's safe to flush.
+        Returns the character position (exclusive end) or -1 if none found.
+        """
+        best = -1
+        for m in self._SAFE_FLUSH_RE.finditer(self.buffer):
+            # m.end() is after the space, which is a clean break point
+            best = m.end()
+        return best
+
+    def _make_text_delta_event(self, text: str) -> bytes:
+        """Construct a single SSE content_block_delta text_delta event."""
+        event_data = json.dumps({
+            "type": "content_block_delta",
+            "index": self._block_index,
+            "delta": {"type": "text_delta", "text": text},
+        })
+        return b"event: content_block_delta\ndata: " + event_data.encode() + b"\n\n"
+
+    def _flush_buffer(self, force: bool = False) -> bytes:
+        """
+        Attempt to flush the buffer.
+        If force=True, flush everything.
+        Otherwise, flush up to the last safe position.
+        Returns SSE bytes to write (may be empty).
+        """
+        if not self.buffer:
+            return b""
+
+        if force:
+            flush_text = self.buffer
+            self.buffer = ""
+        else:
+            pos = self._find_safe_flush_pos()
+            if pos <= 0:
+                # No safe point found -- only force-flush if buffer is large
+                if len(self.buffer) >= self.FORCE_FLUSH_SIZE:
+                    flush_text = self.buffer
+                    self.buffer = ""
+                else:
+                    return b""
+            else:
+                flush_text = self.buffer[:pos]
+                self.buffer = self.buffer[pos:]
+
+        if not flush_text:
+            return b""
+
+        scanned = self._scan_and_flush(flush_text)
+        if not scanned:
+            return b""
+        return self._make_text_delta_event(scanned)
+
+    def process_chunk(self, chunk: bytes) -> bytes:
+        """
+        Process an SSE chunk. Buffers text_delta content and returns
+        modified/passthrough bytes. May return empty bytes when buffering.
+        """
+        output = []
+        # Prepend any partial line from previous chunk
+        data = self._partial_line + chunk
+        self._partial_line = b""
+
+        # SSE streams are line-delimited; split on \\n
+        # We collect lines into events, then process each complete event
+        lines = data.split(b"\n")
+
+        # If data doesn't end with \\n, the last piece is incomplete -- save it
+        if not data.endswith(b"\n"):
+            self._partial_line = lines[-1]
+            lines = lines[:-1]
+
+        # Group lines into events (SSE events are separated by blank lines)
+        current_event_lines = []
+        for line in lines:
+            stripped = line.rstrip(b"\r")
+            if stripped == b"":
+                # Blank line = event boundary
+                if current_event_lines:
+                    event_out = self._process_event_lines(current_event_lines)
+                    if event_out is not None:
+                        output.append(event_out)
+                    current_event_lines = []
+            else:
+                current_event_lines.append(stripped)
+
+        # Any remaining lines are part of an incomplete event -- save for next chunk
+        if current_event_lines:
+            saved = b"\n".join(current_event_lines)
+            if self._partial_line:
+                self._partial_line = saved + b"\n" + self._partial_line
+            else:
+                self._partial_line = saved
+
+        return b"".join(output)
+
+    def _process_event_lines(self, lines: list) -> bytes:
+        """
+        Process a single complete SSE event (a list of stripped lines).
+        Returns bytes to emit, or b"" for buffered events (never None).
+        """
+        # Reconstruct raw event bytes for pass-through
+        raw = b"\n".join(lines) + b"\n\n"
+
+        # Find event type and data payload
+        event_type = None
+        data_payload = None
+        for line in lines:
+            if line.startswith(b"event: "):
+                event_type = line[7:].decode("utf-8", errors="replace").strip()
+            elif line.startswith(b"data: "):
+                data_payload = line[6:]
+
+        if data_payload is None:
+            # No data line (e.g. comment line starting with ':')
+            return raw
+
+        # Try to parse JSON payload
+        try:
+            parsed = json.loads(data_payload)
+        except (json.JSONDecodeError, ValueError):
+            return raw
+
+        event_msg_type = parsed.get("type", "")
+
+        # Handle content_block_delta with text_delta
+        if event_msg_type == "content_block_delta":
+            delta = parsed.get("delta", {})
+            if delta.get("type") == "text_delta":
+                text = delta.get("text", "")
+                # Track the block index for reconstructed events
+                self._block_index = parsed.get("index", self._block_index)
+                # Accumulate into buffer
+                self.buffer += text
+                # Attempt a non-forced flush at a safe boundary
+                flushed = self._flush_buffer(force=False)
+                return flushed  # may be b"" if still buffering
+
+            else:
+                # Non-text delta (e.g. input_json_delta for tool use) -- pass through
+                return raw
+
+        elif event_msg_type == "content_block_stop":
+            # Flush remaining buffer first, then emit the stop event
+            final = self._flush_buffer(force=True)
+            return final + raw
+
+        else:
+            # All other events (message_start, content_block_start, ping,
+            # message_delta, message_stop, error, etc.) -- pass through unchanged
+            return raw
+
+    def flush(self) -> bytes:
+        """
+        Force-flush any remaining buffer.
+        Also merges scanner stats into global PII stats.
+        Call at stream end to ensure nothing is left unscanned.
+        """
+        out = self._flush_buffer(force=True)
+        # Merge per-scanner counts into global stats
+        PII_GLOBAL_STATS["response_redacted"] += self.response_redactions
+        for pii_type, cnt in self._by_type.items():
+            PII_GLOBAL_STATS["response_by_type"][pii_type] += cnt
+        # Reset to avoid double-counting if flush() is called again
+        self.response_redactions = 0
+        self._by_type = defaultdict(int)
+        return out
+
+
 def redact_request_body(body_bytes: bytes, vault: PIIVault) -> bytes:
     """
     Parse the request JSON body, walk message content and system field,
@@ -819,22 +1150,41 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
             stream.enable_chunked_encoding()
             await stream.prepare(request)
             collected_chunks = []
+            scanner = None
             try:
-                async for chunk in resp.content.iter_any():
-                    # ----------------------------------------------------------
-                    # PII Detokenization — replace tokens in each SSE chunk
-                    # Tokens are fixed strings so per-chunk replacement is safe
-                    # ----------------------------------------------------------
-                    if PII_RESPONSE == "detokenize" and vault.count > 0:
+                if PII_RESPONSE == "scan" and PII_MODE != "off":
+                    # Phase 3: SSE streaming with PII scanning via buffered window
+                    scanner = ResponsePIIScanner(vault)
+                    async for chunk in resp.content.iter_any():
+                        collected_chunks.append(chunk)  # originals for usage tracking
+                        processed = scanner.process_chunk(chunk)
+                        if processed:
+                            await stream.write(processed)
+                    # Flush remaining buffered text
+                    final = scanner.flush()
+                    if final:
+                        await stream.write(final)
+                elif PII_RESPONSE == "detokenize" and vault.count > 0:
+                    # Phase 1: simple token replacement per chunk
+                    async for chunk in resp.content.iter_any():
                         chunk = vault.detokenize_bytes(chunk)
-                    await stream.write(chunk)
-                    collected_chunks.append(chunk)
+                        await stream.write(chunk)
+                        collected_chunks.append(chunk)
+                else:
+                    # No PII processing — pass through
+                    async for chunk in resp.content.iter_any():
+                        await stream.write(chunk)
+                        collected_chunks.append(chunk)
                 await stream.write_eof()
             except (ConnectionResetError, asyncio.CancelledError):
                 pass
             finally:
                 update_stream_usage(name, collected_chunks)
                 vault.flush_to_global_stats()
+                # Add response-side scan header after streaming
+                if scanner and scanner.response_redactions > 0:
+                    # Can't add headers after prepare(), but stats are tracked
+                    pass
                 await resp.release()
                 await session.close()
             return stream
@@ -847,10 +1197,18 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                 update_token_usage(name, response_body)
 
             # ------------------------------------------------------------------
-            # PII Detokenization — replace tokens in full response body
+            # PII Response Processing
             # ------------------------------------------------------------------
-            if PII_RESPONSE == "detokenize" and vault.count > 0:
+            resp_scan_count = 0
+            if PII_RESPONSE == "scan" and PII_MODE != "off":
+                # Phase 3: detokenize vault tokens + scan for LLM-generated PII
+                response_body, resp_scan_count = _scan_response_body(response_body, vault)
+            elif PII_RESPONSE == "detokenize" and vault.count > 0:
+                # Phase 1: simple vault token replacement
                 response_body = vault.detokenize_bytes(response_body)
+
+            if resp_scan_count > 0:
+                resp_headers["X-LB-PII-Response-Redacted"] = str(resp_scan_count)
 
             vault.flush_to_global_stats()
             await resp.release()
@@ -919,6 +1277,8 @@ async def status_handler(request: web.Request) -> web.Response:
             "response_mode": PII_RESPONSE,
             "total_redacted": PII_GLOBAL_STATS["total_redacted"],
             "by_type": dict(PII_GLOBAL_STATS["by_type"]),
+            "response_redacted": PII_GLOBAL_STATS["response_redacted"],
+            "response_by_type": dict(PII_GLOBAL_STATS["response_by_type"]),
         },
     })
 
