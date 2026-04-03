@@ -138,6 +138,7 @@ ANTHROPIC_LB_STRATEGY=least-loaded  # or: round-robin
 ANTHROPIC_LB_PII=regex              # regex | presidio | off (default: off)
 ANTHROPIC_LB_PII_RESPONSE=detokenize  # detokenize | scan | off (default: detokenize)
 ANTHROPIC_LB_PII_PATTERNS=./patterns.json  # custom patterns (default: ./patterns.json)
+ANTHROPIC_LB_SPACY_MODEL=en_core_web_lg  # en_core_web_sm (~50MB) | en_core_web_md (~40MB) | en_core_web_lg (~1.2GB)
 ```
 
 ### keys.json

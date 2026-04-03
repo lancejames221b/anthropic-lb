@@ -21,6 +21,7 @@ Configuration:
         ANTHROPIC_LB_PII        PII mode: regex | presidio | off (default: off)
         ANTHROPIC_LB_PII_RESPONSE  Response handling: detokenize | scan | off (default: detokenize)
         ANTHROPIC_LB_PII_PATTERNS  Path to custom patterns JSON (default: ./patterns.json)
+        ANTHROPIC_LB_SPACY_MODEL   spaCy model for Presidio NER (default: en_core_web_lg)
 
     keys.json format:
         {
@@ -75,6 +76,7 @@ STRATEGY = os.environ.get("ANTHROPIC_LB_STRATEGY", "least-loaded")
 PII_MODE = os.environ.get("ANTHROPIC_LB_PII", "off").lower()          # regex | presidio | off
 PII_RESPONSE = os.environ.get("ANTHROPIC_LB_PII_RESPONSE", "detokenize").lower()  # detokenize | scan | off
 PII_PATTERNS_FILE = os.environ.get("ANTHROPIC_LB_PII_PATTERNS", "./patterns.json")
+SPACY_MODEL = os.environ.get("ANTHROPIC_LB_SPACY_MODEL", "en_core_web_lg")  # en_core_web_sm | en_core_web_md | en_core_web_lg
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +265,8 @@ _CUSTOM_PATTERNS = []
 
 class PresidioDetector:
     """
-    Wraps presidio-analyzer with a spaCy en_core_web_lg NLP engine.
+    Wraps presidio-analyzer with a spaCy NLP engine.
+    Model controlled by ANTHROPIC_LB_SPACY_MODEL (default: en_core_web_lg).
     Lazy-initialised on first call so import-time cost is zero.
     """
 
@@ -286,7 +289,7 @@ class PresidioDetector:
         try:
             configuration = {
                 "nlp_engine_name": "spacy",
-                "models": [{"lang_code": "en", "model_name": "en_core_web_lg"}],
+                "models": [{"lang_code": "en", "model_name": SPACY_MODEL}],
             }
             provider = NlpEngineProvider(nlp_configuration=configuration)
             nlp_engine = provider.create_engine()
@@ -298,7 +301,7 @@ class PresidioDetector:
             # Typically: spaCy model not installed
             print(
                 f"[pii] WARNING: presidio/spaCy init failed — {e}\n"
-                "  Install the model with: python -m spacy download en_core_web_lg\n"
+                f"  Install the model with: python -m spacy download {SPACY_MODEL}\n"
                 "  Falling back to regex-only redaction.",
                 file=sys.stderr,
             )
@@ -1308,7 +1311,7 @@ if __name__ == "__main__":
     print(f"  strategy: {STRATEGY}")
     if PII_MODE == "presidio":
         if PRESIDIO_AVAILABLE:
-            print(f"  pii mode: presidio (presidio: available, spacy model: en_core_web_lg)")
+            print(f"  pii mode: presidio (presidio: available, spacy model: {SPACY_MODEL})")
         else:
             print(
                 f"  pii mode: presidio (WARNING: presidio not installed, falling back to regex)",
