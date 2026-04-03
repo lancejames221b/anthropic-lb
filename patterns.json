@@ -1,0 +1,19 @@
+{
+  "_comment": "Custom PII patterns for anthropic-lb. Hot-reloaded when file changes. Set ANTHROPIC_LB_PII_PATTERNS to point here.",
+  "employee_id": {
+    "pattern": "EMP-\\d{6}",
+    "type": "EMPLOYEE_ID"
+  },
+  "project_code": {
+    "pattern": "PRJ-[A-Z]{3}-\\d{4}",
+    "type": "PROJECT_CODE"
+  },
+  "ticket_id": {
+    "pattern": "TICKET-\\d{5,8}",
+    "type": "TICKET_ID"
+  },
+  "internal_hostname": {
+    "pattern": "\\b[a-z]{2,8}-(?:prod|staging|dev)-[a-z0-9]{4,12}\\.internal\\b",
+    "type": "HOSTNAME"
+  }
+}
