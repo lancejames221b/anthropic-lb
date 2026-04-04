@@ -53,6 +53,7 @@ import os
 import re
 import sys
 import time
+import logging
 from collections import defaultdict
 
 from aiohttp import web, ClientSession, ClientTimeout
@@ -77,6 +78,17 @@ PII_MODE = os.environ.get("ANTHROPIC_LB_PII", "off").lower()          # regex | 
 PII_RESPONSE = os.environ.get("ANTHROPIC_LB_PII_RESPONSE", "detokenize").lower()  # detokenize | scan | off
 PII_PATTERNS_FILE = os.environ.get("ANTHROPIC_LB_PII_PATTERNS", "./patterns.json")
 SPACY_MODEL = os.environ.get("ANTHROPIC_LB_SPACY_MODEL", "en_core_web_lg")  # en_core_web_sm | en_core_web_md | en_core_web_lg
+PII_AUDIT_LOG = os.environ.get("ANTHROPIC_LB_PII_AUDIT_LOG", "")  # path to audit log file (empty = disabled)
+
+# PII audit logger — writes redaction events to a dedicated log file
+_pii_audit_logger = None
+if PII_AUDIT_LOG:
+    _pii_audit_logger = logging.getLogger("pii_audit")
+    _pii_audit_logger.setLevel(logging.INFO)
+    _pii_audit_logger.propagate = False
+    _audit_handler = logging.FileHandler(PII_AUDIT_LOG)
+    _audit_handler.setFormatter(logging.Formatter("%(message)s"))
+    _pii_audit_logger.addHandler(_audit_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +423,26 @@ class PIIVault:
         PII_GLOBAL_STATS["total_redacted"] += self.count
         for pii_type, cnt in self.by_type.items():
             PII_GLOBAL_STATS["by_type"][pii_type] += cnt
+
+    def audit_log(self, account: str, path: str):
+        """Write a structured audit log entry if audit logging is enabled."""
+        if not _pii_audit_logger or self.count == 0:
+            return
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        types_summary = ", ".join(f"{t}:{c}" for t, c in sorted(self.by_type.items(), key=lambda x: -x[1]))
+        # Log each detection with original→token mapping (redacted preview)
+        entries = []
+        for original, token in self._fwd.items():
+            # Show first 3 and last 3 chars of original, mask the rest
+            if len(original) > 8:
+                masked = original[:3] + "*" * (len(original) - 6) + original[-3:]
+            else:
+                masked = original[:2] + "*" * max(len(original) - 2, 0)
+            entries.append(f"    {token} ← {masked}")
+        detail = "\n".join(entries)
+        _pii_audit_logger.info(
+            f"[{ts}] account={account} path={path} redacted={self.count} types=[{types_summary}]\n{detail}"
+        )
 
 
 def _redact_text(text: str, vault: PIIVault, patterns) -> str:
@@ -1186,6 +1218,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
             finally:
                 update_stream_usage(name, collected_chunks)
                 vault.flush_to_global_stats()
+                vault.audit_log(name, path)
                 # Add response-side scan header after streaming
                 if scanner and scanner.response_redactions > 0:
                     # Can't add headers after prepare(), but stats are tracked
@@ -1216,6 +1249,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                 resp_headers["X-LB-PII-Response-Redacted"] = str(resp_scan_count)
 
             vault.flush_to_global_stats()
+            vault.audit_log(name, path)
             await resp.release()
             await session.close()
             return web.Response(
@@ -1224,6 +1258,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     except Exception as e:
         STATS[name]["errors"] += 1
         vault.flush_to_global_stats()
+        vault.audit_log(name, path)
         await session.close()
         return web.Response(text=f"upstream error: {e}", status=502)
 
