@@ -54,7 +54,7 @@ import re
 import sys
 import time
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from aiohttp import web, ClientSession, ClientTimeout
 
@@ -89,6 +89,9 @@ if PII_AUDIT_LOG:
     _audit_handler = logging.FileHandler(PII_AUDIT_LOG)
     _audit_handler.setFormatter(logging.Formatter("%(message)s"))
     _pii_audit_logger.addHandler(_audit_handler)
+
+# Module-level logger (configured in __main__ with basicConfig)
+logger = logging.getLogger("anthropic-lb")
 
 
 # ---------------------------------------------------------------------------
@@ -906,18 +909,107 @@ def redact_request_body(body_bytes: bytes, vault: PIIVault) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Key loading & account management (unchanged)
+# Sliding window rate limit tracker (Issue #6)
+# ---------------------------------------------------------------------------
+
+class SlidingWindowTracker:
+    """
+    Per-account sliding-window tracker for RPM and TPM over the last 60 seconds.
+    Used to estimate capacity when Anthropic rate limit headers are unavailable.
+    """
+    WINDOW_SECONDS = 60
+
+    def __init__(self, account_names):
+        self._requests = {name: deque() for name in account_names}
+        self._tokens   = {name: deque() for name in account_names}
+
+    def _prune(self, account):
+        cutoff = time.time() - self.WINDOW_SECONDS
+        while self._requests[account] and self._requests[account][0] < cutoff:
+            self._requests[account].popleft()
+        while self._tokens[account] and self._tokens[account][0][0] < cutoff:
+            self._tokens[account].popleft()
+
+    def record_request(self, account, tokens_used=0):
+        """Record a completed request for this account."""
+        now = time.time()
+        self._prune(account)
+        self._requests[account].append(now)
+        self._tokens[account].append((now, tokens_used))
+
+    def get_rpm(self, account):
+        """Return number of requests in the last 60 seconds."""
+        self._prune(account)
+        return len(self._requests[account])
+
+    def get_tpm(self, account):
+        """Return total tokens consumed in the last 60 seconds."""
+        self._prune(account)
+        return sum(t for _, t in self._tokens[account])
+
+
+# ---------------------------------------------------------------------------
+# Auth header helper (shared by initial request + cascade retry)
+# ---------------------------------------------------------------------------
+
+def _set_auth_headers(headers: dict, api_key: str):
+    """Set authentication headers based on key type (OAuth vs API key)."""
+    if api_key.startswith("sk-ant-oat"):
+        headers["Authorization"] = f"Bearer {api_key}"
+        headers.pop("x-api-key", None)
+        existing_beta = headers.get("anthropic-beta", "")
+        if "oauth-2025-04-20" not in existing_beta:
+            beta_parts = [b for b in existing_beta.split(",") if b.strip()] + ["oauth-2025-04-20"]
+            headers["anthropic-beta"] = ",".join(beta_parts)
+    else:
+        headers["x-api-key"] = api_key
+        headers.pop("authorization", None)
+        headers.pop("Authorization", None)
+
+
+# ---------------------------------------------------------------------------
+# Key loading & account management
 # ---------------------------------------------------------------------------
 
 def load_keys():
-    """Load API keys from keys.json or ANTHROPIC_KEY_N environment variables."""
+    """Load API keys from keys.json or ANTHROPIC_KEY_N environment variables.
+
+    Supports two formats in keys.json (Issue #7):
+
+    Simple format (backwards compatible):
+        {"account-name": "sk-ant-..."}
+
+    Extended format (with rate limit configuration):
+        {
+            "account-name": {
+                "key": "sk-ant-...",
+                "limits": {"rpm": 50, "tpm": 40000, "tpd": 1000000}
+            }
+        }
+
+    Returns:
+        (keys_dict, limits_dict) where limits_dict may be empty.
+    """
     keys = {}
+    limits = {}
 
     if os.path.exists(KEYS_FILE):
         with open(KEYS_FILE) as f:
-            keys = json.load(f)
-        if keys:
-            return keys
+            raw = json.load(f)
+        if raw:
+            for name, value in raw.items():
+                if isinstance(value, str):
+                    # Simple format
+                    keys[name] = value
+                elif isinstance(value, dict):
+                    # Extended format
+                    key = value.get("key", "")
+                    if key:
+                        keys[name] = key
+                    if "limits" in value:
+                        limits[name] = value["limits"]
+            if keys:
+                return keys, limits
 
     i = 1
     while True:
@@ -933,10 +1025,10 @@ def load_keys():
         print(f"  Create {KEYS_FILE} or set ANTHROPIC_KEY_1, ANTHROPIC_KEY_2, ...", file=sys.stderr)
         sys.exit(1)
 
-    return keys
+    return keys, limits
 
 
-KEYS = load_keys()
+KEYS, ACCOUNT_LIMITS = load_keys()
 KEY_NAMES = list(KEYS.keys())
 KEY_CYCLE = itertools.cycle(range(len(KEY_NAMES)))
 START_TIME = time.time()
@@ -964,6 +1056,13 @@ for name in KEYS:
         "rate_limited_until": 0,
         "rate_limit_hits": 0,
     }
+
+
+# Sliding window tracker — instantiated after KEY_NAMES is ready (Issue #6)
+_window_tracker = SlidingWindowTracker(KEY_NAMES)
+
+# Header audit counters — log all response headers for first 3 requests per account (Issue #5)
+_HEADER_AUDIT_COUNT = {name: 0 for name in KEY_NAMES}
 
 
 def update_rate_limits(name, headers):
@@ -994,16 +1093,21 @@ def update_token_usage(name, body_bytes):
         data = json.loads(body_bytes)
         usage = data.get("usage", {})
         s = STATS[name]
-        s["tokens_in"] += usage.get("input_tokens", 0)
-        s["tokens_out"] += usage.get("output_tokens", 0)
+        inp = usage.get("input_tokens", 0)
+        out = usage.get("output_tokens", 0)
+        s["tokens_in"] += inp
+        s["tokens_out"] += out
         s["tokens_cache_read"] += usage.get("cache_read_input_tokens", 0)
         s["tokens_cache_write"] += usage.get("cache_creation_input_tokens", 0)
+        # Record in sliding window for capacity scoring (Issue #6)
+        _window_tracker.record_request(name, inp + out)
     except (json.JSONDecodeError, AttributeError):
         pass
 
 
 def update_stream_usage(name, chunks):
     """Extract token usage from SSE stream (message_delta event has usage)."""
+    total_tokens = 0
     try:
         for chunk in chunks:
             if b'"type":"message_delta"' in chunk or b'"type": "message_delta"' in chunk:
@@ -1012,18 +1116,25 @@ def update_stream_usage(name, chunks):
                         data = json.loads(line[6:])
                         usage = data.get("usage", {})
                         s = STATS[name]
-                        s["tokens_out"] += usage.get("output_tokens", 0)
+                        out = usage.get("output_tokens", 0)
+                        s["tokens_out"] += out
+                        total_tokens += out
             if b'"type":"message_start"' in chunk or b'"type": "message_start"' in chunk:
                 for line in chunk.split(b"\n"):
                     if line.startswith(b"data: "):
                         data = json.loads(line[6:])
                         usage = data.get("message", {}).get("usage", {})
                         s = STATS[name]
-                        s["tokens_in"] += usage.get("input_tokens", 0)
+                        inp = usage.get("input_tokens", 0)
+                        s["tokens_in"] += inp
                         s["tokens_cache_read"] += usage.get("cache_read_input_tokens", 0)
                         s["tokens_cache_write"] += usage.get("cache_creation_input_tokens", 0)
+                        total_tokens += inp
     except (json.JSONDecodeError, AttributeError, KeyError):
         pass
+    # Record in sliding window for capacity scoring (Issue #6)
+    if total_tokens > 0:
+        _window_tracker.record_request(name, total_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -1031,47 +1142,82 @@ def update_stream_usage(name, chunks):
 # ---------------------------------------------------------------------------
 
 def pick_account_least_loaded():
-    """Pick the account with the most remaining capacity.
+    """Pick the account with the highest capacity score (Issue #8).
 
-    Priority:
-    1. If rate limit headers are available, use tokens_remaining (real data)
-    2. Otherwise, use least total tokens consumed (balanced distribution)
-    3. Skip any account that is currently rate-limited (429 cooldown)
+    Scoring priority:
+    1. Skip accounts in 429 cooldown
+    2. If Anthropic rate limit headers available: normalize remaining/limit
+    3. Else if limits configured in keys.json: headroom from sliding window
+    4. Skip saturated accounts (rpm_headroom <= 0 or tpm_headroom <= 0)
+    5. Fallback to least-used heuristic when no data exists
     """
     now = time.time()
-    available = []
-
-    for name in KEY_NAMES:
-        s = STATS[name]
-        if s["rate_limited_until"] > now:
-            continue
-        available.append(name)
+    available = [n for n in KEY_NAMES if STATS[n]["rate_limited_until"] <= now]
 
     if not available:
         # All rate-limited: pick the one that resets soonest
         soonest = min(KEY_NAMES, key=lambda n: STATS[n]["rate_limited_until"])
         return soonest, KEYS[soonest]
 
-    # Check if any account has real rate limit data
-    has_rate_data = any(
-        STATS[n]["rate_tokens_remaining"] is not None for n in available
+    has_header_data = any(STATS[n]["rate_tokens_remaining"] is not None for n in available)
+
+    scored = []
+    for name in available:
+        s = STATS[name]
+        lims = ACCOUNT_LIMITS.get(name, {})
+
+        if has_header_data and s["rate_tokens_remaining"] is not None:
+            # Primary path: use real headers, normalize to [0, 1]
+            token_limit = s["rate_tokens_limit"] or 100_000
+            req_limit   = s["rate_requests_limit"] or 1_000
+            token_score = (s["rate_tokens_remaining"] or 0) / token_limit
+            req_score   = (s["rate_requests_remaining"] or 0) / req_limit
+            score = min(token_score, req_score)
+
+        elif lims:
+            # Secondary path: sliding window + declared limits
+            rpm_limit = lims.get("rpm", 0)
+            tpm_limit = lims.get("tpm", 0)
+            rpm_used  = _window_tracker.get_rpm(name)
+            tpm_used  = _window_tracker.get_tpm(name)
+            rpm_headroom = (rpm_limit - rpm_used) if rpm_limit else 1
+            tpm_headroom = (tpm_limit - tpm_used) if tpm_limit else 1
+
+            # Skip saturated accounts
+            if rpm_limit and rpm_headroom <= 0:
+                continue
+            if tpm_limit and tpm_headroom <= 0:
+                continue
+
+            rpm_score = (rpm_headroom / rpm_limit) if rpm_limit else 1.0
+            tpm_score = (tpm_headroom / tpm_limit) if tpm_limit else 1.0
+            score = min(rpm_score, tpm_score)
+
+        else:
+            # Tertiary path: least-used heuristic
+            total = s["tokens_in"] + s["tokens_out"]
+            max_total = max(
+                (STATS[n]["tokens_in"] + STATS[n]["tokens_out"]) for n in available
+            ) or 1
+            score = 1.0 - (total / max_total)
+
+        scored.append((name, score))
+
+    if not scored:
+        # All accounts appear saturated — pick first available anyway
+        best = available[0]
+        logger.warning(f"[ROUTE] all_saturated fallback account={best}")
+        return best, KEYS[best]
+
+    best_name, best_score = max(scored, key=lambda x: x[1])
+    lims = ACCOUNT_LIMITS.get(best_name, {})
+    logger.debug(
+        "[ROUTE] selected=%s score=%.3f rpm_used=%s/%s tpm_used=%s/%s",
+        best_name, best_score,
+        _window_tracker.get_rpm(best_name), lims.get("rpm", "?"),
+        _window_tracker.get_tpm(best_name), lims.get("tpm", "?"),
     )
-
-    if has_rate_data:
-        # Use real rate limit data: pick highest remaining tokens
-        best = max(available, key=lambda n: STATS[n]["rate_tokens_remaining"] or 0)
-    else:
-        # No rate limit headers: pick least-used by total tokens + request count
-        # Request count breaks ties when token data hasn't arrived yet
-        best = min(
-            available,
-            key=lambda n: (
-                STATS[n]["tokens_in"] + STATS[n]["tokens_out"],
-                STATS[n]["requests"],
-            ),
-        )
-
-    return best, KEYS[best]
+    return best_name, KEYS[best_name]
 
 
 def pick_account_round_robin():
@@ -1106,24 +1252,13 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
         if kl in ("host", "content-length", "transfer-encoding"):
             continue
         headers[k] = v
-    # Set auth -- OAuth tokens (sk-ant-oat*) need Bearer + beta flag, API keys use x-api-key
-    if api_key.startswith("sk-ant-oat"):
-        headers["Authorization"] = f"Bearer {api_key}"
-        headers.pop("x-api-key", None)
-        # OAuth requires the beta flag to be accepted by the API
-        existing_beta = headers.get("anthropic-beta", "")
-        if "oauth-2025-04-20" not in existing_beta:
-            beta_parts = [b for b in existing_beta.split(",") if b.strip()] + ["oauth-2025-04-20"]
-            headers["anthropic-beta"] = ",".join(beta_parts)
-    else:
-        headers["x-api-key"] = api_key
-        headers.pop("authorization", None)
-        headers.pop("Authorization", None)
+    # Set auth using shared helper
+    _set_auth_headers(headers, api_key)
 
     body = await request.read()
 
     # ------------------------------------------------------------------
-    # PII Redaction — tokenize PII in request body before forwarding
+    # PII Redaction -- tokenize PII in request body before forwarding
     # ------------------------------------------------------------------
     vault = PIIVault()
     if PII_MODE in ("regex", "presidio"):
@@ -1137,31 +1272,82 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     try:
         resp = await session.request(request.method, url, headers=headers, data=body)
 
-        # On 429, mark account and try next
-        if resp.status == 429:
-            STATS[name]["errors"] += 1
-            STATS[name]["rate_limit_hits"] += 1
-            # Parse retry-after or default to 60s
-            retry_after = resp.headers.get("retry-after")
-            cooldown = int(retry_after) if retry_after and retry_after.isdigit() else 60
-            STATS[name]["rate_limited_until"] = time.time() + cooldown
-            STATS[name]["rate_tokens_remaining"] = 0
-            await resp.release()
+        # ------------------------------------------------------------------
+        # Header audit -- log all response headers for first 3 requests
+        # per account so we can see what Anthropic actually sends (Issue #5)
+        # ------------------------------------------------------------------
+        if _HEADER_AUDIT_COUNT.get(name, 0) < 3:
+            _HEADER_AUDIT_COUNT[name] = _HEADER_AUDIT_COUNT.get(name, 0) + 1
+            logger.debug(
+                "[HEADER-AUDIT] account=%s status=%s headers=%s",
+                name, resp.status, dict(resp.headers),
+            )
 
-            name2, api_key2 = pick_account()
-            STATS[name2]["requests"] += 1
-            STATS[name2]["last_used"] = time.time()
-            if api_key2.startswith("sk-ant-oat"):
-                headers["Authorization"] = f"Bearer {api_key2}"
-                headers.pop("x-api-key", None)
-                existing_beta = headers.get("anthropic-beta", "")
-                if "oauth-2025-04-20" not in existing_beta:
-                    beta_parts = [b for b in existing_beta.split(",") if b.strip()] + ["oauth-2025-04-20"]
-                    headers["anthropic-beta"] = ",".join(beta_parts)
-            else:
-                headers["x-api-key"] = api_key2
-            resp = await session.request(request.method, url, headers=headers, data=body)
-            name = name2
+        # ------------------------------------------------------------------
+        # Cascade retry on 429 -- try ALL accounts before giving up (Issue #9)
+        # ------------------------------------------------------------------
+        if resp.status == 429:
+            tried_accounts = {name}
+            last_retry_after = 10
+
+            while True:
+                ra_hdr = resp.headers.get("retry-after")
+                cooldown = int(ra_hdr) if ra_hdr and ra_hdr.isdigit() else 60
+                last_retry_after = cooldown
+                STATS[name]["errors"] += 1
+                STATS[name]["rate_limit_hits"] += 1
+                STATS[name]["rate_limited_until"] = time.time() + cooldown
+                STATS[name]["rate_tokens_remaining"] = 0
+                logger.warning(
+                    "[RETRY] 429 account=%s cooldown=%ss remaining_accounts=%s",
+                    name, cooldown, len(KEY_NAMES) - len(tried_accounts),
+                )
+                await resp.release()
+
+                untried = [
+                    n for n in KEY_NAMES
+                    if n not in tried_accounts and STATS[n]["rate_limited_until"] <= time.time()
+                ]
+                if not untried:
+                    # All accounts exhausted -- wait then try once more
+                    logger.warning(
+                        "[RETRY] all_accounts_saturated waiting=%ss then retrying", last_retry_after,
+                    )
+                    await asyncio.sleep(last_retry_after)
+                    name, _ = pick_account()
+                    STATS[name]["requests"] += 1
+                    STATS[name]["last_used"] = time.time()
+                    _set_auth_headers(headers, KEYS[name])
+                    resp = await session.request(request.method, url, headers=headers, data=body)
+                    if resp.status == 429:
+                        await resp.release()
+                        await session.close()
+                        return web.Response(
+                            body=json.dumps({
+                                "error": "all_accounts_saturated",
+                                "retry_after": last_retry_after,
+                            }).encode(),
+                            status=429,
+                            content_type="application/json",
+                            headers={
+                                "X-LB-Account": name,
+                                "retry-after": str(last_retry_after),
+                            },
+                        )
+                    break
+
+                name = untried[0]
+                tried_accounts.add(name)
+                STATS[name]["requests"] += 1
+                STATS[name]["last_used"] = time.time()
+                _set_auth_headers(headers, KEYS[name])
+                logger.debug(
+                    "[RETRY] attempt=%s account=%s remaining_accounts=%s",
+                    len(tried_accounts), name, len(KEY_NAMES) - len(tried_accounts),
+                )
+                resp = await session.request(request.method, url, headers=headers, data=body)
+                if resp.status != 429:
+                    break
 
         # Capture rate limit headers
         update_rate_limits(name, resp.headers)
@@ -1296,6 +1482,10 @@ async def status_handler(request: web.Request) -> web.Response:
                 "rate_limited": rate_limited,
                 "rate_limited_for": f"{s['rate_limited_until'] - now:.0f}s" if rate_limited else None,
                 "total_429s": s["rate_limit_hits"],
+                # Sliding window estimates (Issue #6)
+                "window_rpm": _window_tracker.get_rpm(name),
+                "window_tpm": _window_tracker.get_tpm(name),
+                "configured_limits": ACCOUNT_LIMITS.get(name, {}),
             },
         }
 
@@ -1390,6 +1580,15 @@ app.router.add_route("*", "/test-pii", test_pii_handler)
 app.router.add_route("*", "/{path:.*}", proxy_handler)
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    logger.info(
+        "[CONFIG] PII_MODE=%s STRATEGY=%s accounts=%s upstream=%s",
+        PII_MODE, STRATEGY, len(KEYS), UPSTREAM,
+    )
     print(f"anthropic-lb starting on :{PORT}")
     print(f"  accounts: {', '.join(KEY_NAMES)} ({len(KEYS)} keys)")
     print(f"  upstream: {UPSTREAM}")
