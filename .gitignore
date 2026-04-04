@@ -1,0 +1,20 @@
+# Secrets — never commit
+keys.json
+.env
+.env.*
+*.env
+
+# Logs — may contain PII
+pii-audit.log
+*.log
+
+# Runtime
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build/dist
+public/
+dist/
+*.egg-info/
