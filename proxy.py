@@ -1301,9 +1301,57 @@ async def health_handler(request: web.Request) -> web.Response:
     })
 
 
+async def test_pii_handler(request: web.Request) -> web.Response:
+    """
+    Test endpoint: POST /test-pii with {"text": "..."} or GET /test-pii?text=...
+    Shows exactly what the proxy does — original, tokenized (Anthropic sees), and restored (client sees).
+    """
+    if request.method == "POST":
+        try:
+            data = await request.json()
+            text = data.get("text", "")
+        except Exception:
+            text = (await request.text()).strip()
+    else:
+        text = request.query.get("text", "")
+
+    if not text:
+        return web.json_response({
+            "error": "Provide text via POST body {\"text\": \"...\"} or GET ?text=...",
+            "example": "curl -X POST http://localhost:8891/test-pii -d '{\"text\": \"Email john@acme.com at 555-123-4567\"}'",
+        }, status=400)
+
+    vault = PIIVault()
+    patterns = _get_all_patterns()
+    tokenized = _redact_text(text, vault, patterns)
+    restored = vault.detokenize(tokenized)
+
+    detections = []
+    for original, token in vault._fwd.items():
+        # Find the type from the token format __PII_{TYPE}_{hash}__
+        parts = token.split("_")
+        pii_type = "_".join(parts[3:-2]) if len(parts) >= 5 else "UNKNOWN"
+        detections.append({
+            "original": original,
+            "token": token,
+            "type": pii_type,
+        })
+
+    return web.json_response({
+        "pii_mode": PII_MODE,
+        "original": text,
+        "anthropic_sees": tokenized,
+        "client_sees": restored,
+        "pii_detected": len(detections),
+        "detections": detections,
+        "round_trip_ok": restored == text,
+    }, dumps=lambda obj: json.dumps(obj, indent=2))
+
+
 app = web.Application()
 app.router.add_get("/status", status_handler)
 app.router.add_get("/health", health_handler)
+app.router.add_route("*", "/test-pii", test_pii_handler)
 app.router.add_route("*", "/{path:.*}", proxy_handler)
 
 if __name__ == "__main__":
