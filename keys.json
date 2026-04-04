@@ -1,5 +1,26 @@
 {
-  "max": "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",
-  "jamesgroup": "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",
-  "unit": "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"
+  "max": {
+    "key": "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",
+    "limits": {
+      "rpm": 4000,
+      "itpm": 400000,
+      "otpm": 80000
+    }
+  },
+  "jamesgroup": {
+    "key": "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",
+    "limits": {
+      "rpm": 4000,
+      "itpm": 400000,
+      "otpm": 80000
+    }
+  },
+  "unit": {
+    "key": "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",
+    "limits": {
+      "rpm": 4000,
+      "itpm": 400000,
+      "otpm": 80000
+    }
+  }
 }

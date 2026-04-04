@@ -1,5 +1,23 @@
 {
-    "account-1": "sk-ant-api03-your-first-key-here",
-    "account-2": "sk-ant-api03-your-second-key-here",
-    "account-3": "sk-ant-api03-your-third-key-here"
+    "_comment": "Both formats supported — simple strings or objects with limits",
+
+    "simple-account": "sk-ant-api03-your-key-here",
+
+    "oauth-account": {
+        "key": "sk-ant-oat01-your-oauth-key-here",
+        "limits": {
+            "rpm": 4000,
+            "itpm": 400000,
+            "otpm": 80000
+        }
+    },
+
+    "api-key-tier1": {
+        "key": "sk-ant-api03-your-key-here",
+        "limits": {
+            "rpm": 50,
+            "itpm": 20000,
+            "otpm": 4000
+        }
+    }
 }
