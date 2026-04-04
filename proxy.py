@@ -1045,13 +1045,22 @@ for name in KEYS:
         "tokens_out": 0,
         "tokens_cache_read": 0,
         "tokens_cache_write": 0,
-        # Rate limits (from response headers)
+        # Rate limits — standard API key accounts (x-api-key)
         "rate_requests_limit": None,
         "rate_requests_remaining": None,
         "rate_requests_reset": None,
         "rate_tokens_limit": None,
         "rate_tokens_remaining": None,
         "rate_tokens_reset": None,
+        # Unified rate limits — OAuth/Max accounts (sk-ant-oat* keys)
+        # Uses time-window utilization model instead of requests/tokens remaining
+        "unified_status": None,              # 'allowed' | 'allowed_warning' | 'rejected'
+        "unified_5h_utilization": None,      # 0.0-1.0 (five-hour session window)
+        "unified_5h_reset": None,            # unix timestamp
+        "unified_7d_utilization": None,      # 0.0-1.0 (seven-day weekly window)
+        "unified_7d_reset": None,            # unix timestamp
+        "unified_fallback": None,            # 'available' or None
+        "unified_representative_claim": None,  # '5h' | '7d' | 'overage'
         # 429 tracking
         "rate_limited_until": 0,
         "rate_limit_hits": 0,
@@ -1066,10 +1075,18 @@ _HEADER_AUDIT_COUNT = {name: 0 for name in KEY_NAMES}
 
 
 def update_rate_limits(name, headers):
-    """Extract Anthropic rate limit headers and update account stats."""
+    """Extract Anthropic rate limit headers and update account stats.
+
+    Handles two distinct header schemes:
+    - Standard API keys (x-api-key): anthropic-ratelimit-requests-* / tokens-*
+    - OAuth/Max accounts (sk-ant-oat*): anthropic-ratelimit-unified-* (utilization model)
+    """
     s = STATS[name]
     h = lambda k: headers.get(k)
 
+    # ------------------------------------------------------------------
+    # Standard API key headers (requests + tokens remaining)
+    # ------------------------------------------------------------------
     rl = h("anthropic-ratelimit-requests-limit")
     if rl:
         s["rate_requests_limit"] = int(rl)
@@ -1085,6 +1102,44 @@ def update_rate_limits(name, headers):
     if tr:
         s["rate_tokens_remaining"] = int(tr)
     s["rate_tokens_reset"] = h("anthropic-ratelimit-tokens-reset")
+
+    # ------------------------------------------------------------------
+    # Unified headers — OAuth/Max accounts (sk-ant-oat* keys)
+    # Source: leaked Claude Code src/services/claudeAiLimits.ts
+    # ------------------------------------------------------------------
+    unified_status = h("anthropic-ratelimit-unified-status")
+    if unified_status:
+        s["unified_status"] = unified_status
+
+    util_5h = h("anthropic-ratelimit-unified-5h-utilization")
+    if util_5h is not None:
+        s["unified_5h_utilization"] = float(util_5h)
+    reset_5h = h("anthropic-ratelimit-unified-5h-reset")
+    if reset_5h:
+        s["unified_5h_reset"] = float(reset_5h)
+
+    util_7d = h("anthropic-ratelimit-unified-7d-utilization")
+    if util_7d is not None:
+        s["unified_7d_utilization"] = float(util_7d)
+    reset_7d = h("anthropic-ratelimit-unified-7d-reset")
+    if reset_7d:
+        s["unified_7d_reset"] = float(reset_7d)
+
+    fallback = h("anthropic-ratelimit-unified-fallback")
+    if fallback:
+        s["unified_fallback"] = fallback
+    claim = h("anthropic-ratelimit-unified-representative-claim")
+    if claim:
+        s["unified_representative_claim"] = claim
+
+    if unified_status:
+        logger.debug(
+            "[UNIFIED-LIMITS] account=%s status=%s 5h_util=%.2f 7d_util=%.2f claim=%s",
+            name, unified_status,
+            s["unified_5h_utilization"] or 0.0,
+            s["unified_7d_utilization"] or 0.0,
+            claim or "?",
+        )
 
 
 def update_token_usage(name, body_bytes):
@@ -1165,9 +1220,29 @@ def pick_account_least_loaded():
     for name in available:
         s = STATS[name]
         lims = ACCOUNT_LIMITS.get(name, {})
+        is_oauth = KEYS[name].startswith("sk-ant-oat")
 
-        if has_header_data and s["rate_tokens_remaining"] is not None:
-            # Primary path: use real headers, normalize to [0, 1]
+        if is_oauth and s["unified_status"] is not None:
+            # OAuth/Max path: unified utilization model (Issue #10)
+            # Capacity = 1 - worst_window_utilization
+            # Source: leaked Claude Code src/services/claudeAiLimits.ts
+            if s["unified_status"] == "rejected":
+                # Hard limit hit — skip this account entirely
+                logger.debug("[ROUTE] skip account=%s reason=unified_rejected", name)
+                continue
+            util_5h = s["unified_5h_utilization"] or 0.0
+            util_7d = s["unified_7d_utilization"] or 0.0
+            worst = max(util_5h, util_7d)
+            score = 1.0 - worst
+            if score <= 0.0:
+                logger.debug(
+                    "[ROUTE] skip account=%s reason=unified_saturated 5h=%.2f 7d=%.2f",
+                    name, util_5h, util_7d,
+                )
+                continue
+
+        elif has_header_data and s["rate_tokens_remaining"] is not None:
+            # Standard API key path: use real headers, normalize to [0, 1]
             token_limit = s["rate_tokens_limit"] or 100_000
             req_limit   = s["rate_requests_limit"] or 1_000
             token_score = (s["rate_tokens_remaining"] or 0) / token_limit
@@ -1225,6 +1300,78 @@ def pick_account_round_robin():
     idx = next(KEY_CYCLE)
     name = KEY_NAMES[idx]
     return name, KEYS[name]
+
+
+# ---------------------------------------------------------------------------
+# OAuth usage poller — proactively fetch /api/oauth/usage for OAuth accounts
+# ---------------------------------------------------------------------------
+
+async def _poll_oauth_usage(session: ClientSession, name: str, api_key: str):
+    """
+    Fetch /api/oauth/usage for an OAuth account and update STATS with
+    pre-request utilization data.
+
+    Endpoint: GET {UPSTREAM}/api/oauth/usage
+    Response: {five_hour, seven_day, seven_day_oauth_apps, seven_day_opus,
+               seven_day_sonnet, extra_usage}
+    Each window: {utilization: 0-100 (percent), resets_at: ISO8601}
+
+    Source: leaked Claude Code src/services/api/usage.ts
+    """
+    if not api_key.startswith("sk-ant-oat"):
+        return
+
+    url = f"{UPSTREAM}/api/oauth/usage"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                logger.debug("[OAUTH-USAGE] account=%s status=%s", name, resp.status)
+                return
+            data = await resp.json()
+            s = STATS[name]
+
+            # The API returns utilization as 0-100 percent; normalise to 0.0-1.0
+            five_hour = data.get("five_hour") or {}
+            seven_day = data.get("seven_day") or {}
+
+            if five_hour.get("utilization") is not None:
+                s["unified_5h_utilization"] = five_hour["utilization"] / 100.0
+            if seven_day.get("utilization") is not None:
+                s["unified_7d_utilization"] = seven_day["utilization"] / 100.0
+
+            # Seed unified_status from utilization if not already set by headers
+            if s["unified_status"] is None:
+                worst = max(
+                    s["unified_5h_utilization"] or 0.0,
+                    s["unified_7d_utilization"] or 0.0,
+                )
+                s["unified_status"] = "rejected" if worst >= 1.0 else "allowed"
+
+            logger.info(
+                "[OAUTH-USAGE] account=%s 5h=%.1f%% 7d=%.1f%%",
+                name,
+                (s["unified_5h_utilization"] or 0.0) * 100,
+                (s["unified_7d_utilization"] or 0.0) * 100,
+            )
+    except Exception as e:
+        logger.debug("[OAUTH-USAGE] account=%s error=%s", name, e)
+
+
+async def _oauth_usage_poll_loop():
+    """Background task: poll /api/oauth/usage every 60s for all OAuth accounts."""
+    oauth_accounts = [(n, k) for n, k in KEYS.items() if k.startswith("sk-ant-oat")]
+    if not oauth_accounts:
+        return
+    async with ClientSession() as session:
+        while True:
+            for name, api_key in oauth_accounts:
+                await _poll_oauth_usage(session, name, api_key)
+            await asyncio.sleep(60)
 
 
 def pick_account():
@@ -1474,6 +1621,7 @@ async def status_handler(request: web.Request) -> web.Response:
                 "total": s["tokens_in"] + s["tokens_out"],
             },
             "rate_limits": {
+                # Standard API key fields
                 "requests_remaining": s["rate_requests_remaining"],
                 "requests_limit": s["rate_requests_limit"],
                 "tokens_remaining": s["rate_tokens_remaining"],
@@ -1482,10 +1630,18 @@ async def status_handler(request: web.Request) -> web.Response:
                 "rate_limited": rate_limited,
                 "rate_limited_for": f"{s['rate_limited_until'] - now:.0f}s" if rate_limited else None,
                 "total_429s": s["rate_limit_hits"],
-                # Sliding window estimates (Issue #6)
+                # Sliding window estimates
                 "window_rpm": _window_tracker.get_rpm(name),
                 "window_tpm": _window_tracker.get_tpm(name),
                 "configured_limits": ACCOUNT_LIMITS.get(name, {}),
+                # Unified fields — OAuth/Max accounts
+                "unified_status": s["unified_status"],
+                "unified_5h_utilization": s["unified_5h_utilization"],
+                "unified_7d_utilization": s["unified_7d_utilization"],
+                "unified_capacity": round(
+                    1.0 - max(s["unified_5h_utilization"] or 0.0, s["unified_7d_utilization"] or 0.0), 3
+                ) if s["unified_status"] is not None else None,
+                "unified_representative_claim": s["unified_representative_claim"],
             },
         }
 
@@ -1573,7 +1729,13 @@ async def test_pii_handler(request: web.Request) -> web.Response:
     }, dumps=lambda obj: json.dumps(obj, indent=2))
 
 
+async def _on_startup(app):
+    """Start background tasks on app startup."""
+    asyncio.create_task(_oauth_usage_poll_loop())
+
+
 app = web.Application()
+app.on_startup.append(_on_startup)
 app.router.add_get("/status", status_handler)
 app.router.add_get("/health", health_handler)
 app.router.add_route("*", "/test-pii", test_pii_handler)
