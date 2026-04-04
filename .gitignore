@@ -8,6 +8,14 @@ keys.json
 pii-audit.log
 *.log
 
+# PII vault — contains real↔synthetic mappings
+pii_vault.json
+
+# Secrets — encrypted pre-map and source files
+secrets.json
+secrets*.enc
+secrets_premap.enc
+
 # Runtime
 venv/
 __pycache__/
@@ -18,3 +26,6 @@ __pycache__/
 public/
 dist/
 *.egg-info/
+
+# Docker runtime
+lb-logs/

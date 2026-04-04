@@ -1,0 +1,66 @@
+services:
+  anthropic-lb:
+    build:
+      context: .
+      args:
+        INSTALL_PRESIDIO: "${INSTALL_PRESIDIO:-false}"
+    container_name: anthropic-lb
+    restart: unless-stopped
+    ports:
+      - "${LB_PORT:-9891}:8891"
+    volumes:
+      - ./keys.json:/app/keys.json:ro
+      - ./patterns.json:/app/patterns.json:ro
+      - ./secrets-test.json:/app/secrets.json:ro
+      - ./test.env:/app/protect/test.env:ro
+      - lb-logs:/app/logs
+      - lb-vault:/app/vault
+    environment:
+      - ANTHROPIC_LB_PII=${LB_PII:-regex}
+      - ANTHROPIC_LB_PII_RESPONSE=${LB_PII_RESPONSE:-detokenize}
+      - ANTHROPIC_LB_STRATEGY=${LB_STRATEGY:-least-loaded}
+      - ANTHROPIC_LB_PII_AUDIT_LOG=/app/logs/pii-audit.log
+      - ANTHROPIC_LB_W5H=${LB_W5H:-1.0}
+      - ANTHROPIC_LB_W7D=${LB_W7D:-2.0}
+      - ANTHROPIC_LB_PII_VAULT=/app/vault/pii_vault.json
+      - ANTHROPIC_LB_SECRETS=${LB_SECRETS:-off}
+      - ANTHROPIC_LB_SECRETS_FILE=${LB_SECRETS_FILE:-/app/secrets.json}
+      - ANTHROPIC_LB_SECRETS_KEY=${LB_SECRETS_KEY:-}
+      - ANTHROPIC_LB_REDIS=${LB_REDIS:-}
+      - ANTHROPIC_LB_PROTECT_FILES=${LB_PROTECT_FILES:-}
+    networks:
+      - lb-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: anthropic-lb-redis
+    restart: unless-stopped
+    volumes:
+      - lb-redis:/data
+    command: redis-server --appendonly yes
+    networks:
+      - lb-net
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: anthropic-lb-dashboard
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-9892}:8080"
+    environment:
+      - LB_UPSTREAM=http://anthropic-lb:8891
+    depends_on:
+      - anthropic-lb
+    networks:
+      - lb-net
+
+volumes:
+  lb-logs:
+  lb-vault:
+  lb-redis:
+
+networks:
+  lb-net:
+    driver: bridge

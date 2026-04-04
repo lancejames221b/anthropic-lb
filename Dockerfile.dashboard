@@ -1,0 +1,15 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir aiohttp>=3.9.0
+
+COPY dashboard.py .
+COPY dashboard.html .
+
+ENV LB_UPSTREAM=http://anthropic-lb:8891
+ENV DASHBOARD_PORT=8080
+
+EXPOSE 8080
+
+CMD ["python3", "dashboard.py"]

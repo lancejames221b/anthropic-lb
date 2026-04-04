@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>anthropic-lb dashboard</title>
+<style>
+:root {
+  --bg: #0d1117; --surface: #161b22; --border: #30363d; --text: #c9d1d9;
+  --text-dim: #8b949e; --accent: #58a6ff; --green: #3fb950; --red: #f85149;
+  --orange: #d29922; --purple: #bc8cff;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: 'SF Mono','Fira Code','Consolas', monospace; background:var(--bg); color:var(--text); font-size:13px; }
+.container { max-width:1400px; margin:0 auto; padding:16px; }
+header { display:flex; justify-content:space-between; align-items:center; padding:12px 0; border-bottom:1px solid var(--border); margin-bottom:16px; }
+header h1 { font-size:18px; font-weight:600; color:var(--accent); }
+header .status { display:flex; gap:12px; align-items:center; }
+.badge { padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+.badge-green { background:rgba(63,185,80,0.15); color:var(--green); border:1px solid rgba(63,185,80,0.3); }
+.badge-red { background:rgba(248,81,73,0.15); color:var(--red); border:1px solid rgba(248,81,73,0.3); }
+.badge-orange { background:rgba(210,153,34,0.15); color:var(--orange); border:1px solid rgba(210,153,34,0.3); }
+
+.grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px; }
+.grid-3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; margin-bottom:16px; }
+@media (max-width: 768px) {
+  .grid, .grid-3 { grid-template-columns:1fr; }
+  header { flex-direction:column; gap:8px; align-items:flex-start; }
+  header .status { flex-wrap:wrap; }
+  .container { padding:10px; }
+  table { font-size:11px; display:block; overflow-x:auto; white-space:nowrap; }
+  table th, table td { padding:4px 6px; }
+  .card { padding:12px; }
+  body { font-size:12px; }
+}
+.card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:16px; }
+.card h2 { font-size:13px; font-weight:600; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:12px; }
+.card h3 { font-size:12px; color:var(--accent); margin-bottom:8px; }
+
+.stat { display:flex; justify-content:space-between; padding:4px 0; }
+.stat .label { color:var(--text-dim); }
+.stat .value { font-weight:600; }
+.stat .value.green { color:var(--green); }
+.stat .value.red { color:var(--red); }
+.stat .value.orange { color:var(--orange); }
+.stat .value.accent { color:var(--accent); }
+
+.bar-container { height:6px; background:var(--border); border-radius:3px; margin:4px 0 8px; overflow:hidden; }
+.bar { height:100%; border-radius:3px; transition:width 0.5s ease; }
+.bar-green { background:var(--green); }
+.bar-orange { background:var(--orange); }
+.bar-red { background:var(--red); }
+
+table { width:100%; border-collapse:collapse; }
+table th { text-align:left; font-size:11px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px; padding:6px 8px; border-bottom:1px solid var(--border); }
+table td { padding:6px 8px; border-bottom:1px solid rgba(48,54,61,0.5); font-size:12px; }
+table tr:hover { background:rgba(88,166,255,0.05); }
+
+.pii-test { display:flex; flex-direction:column; gap:8px; }
+.pii-test textarea { background:var(--bg); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:10px; font-family:inherit; font-size:12px; resize:vertical; min-height:80px; }
+.pii-test button { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:8px 16px; cursor:pointer; font-family:inherit; font-weight:600; font-size:12px; align-self:flex-start; }
+.pii-test button:hover { opacity:0.9; }
+.pii-result { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:10px; font-size:12px; white-space:pre-wrap; max-height:300px; overflow-y:auto; display:none; }
+.pii-detection { display:inline-block; padding:1px 5px; border-radius:3px; margin:1px; font-size:11px; }
+.pii-detection.EMAIL { background:rgba(88,166,255,0.15); color:var(--accent); }
+.pii-detection.PHONE { background:rgba(188,140,255,0.15); color:var(--purple); }
+.pii-detection.SSN { background:rgba(248,81,73,0.15); color:var(--red); }
+.pii-detection.CREDIT_CARD { background:rgba(248,81,73,0.15); color:var(--red); }
+.pii-detection.IP_ADDRESS { background:rgba(210,153,34,0.15); color:var(--orange); }
+.pii-detection.API_KEY { background:rgba(248,81,73,0.2); color:var(--red); }
+.pii-detection.BEARER_TOKEN { background:rgba(248,81,73,0.2); color:var(--red); }
+
+.log { font-size:11px; max-height:200px; overflow-y:auto; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:8px; }
+.log-entry { padding:2px 0; border-bottom:1px solid rgba(48,54,61,0.3); }
+.log-entry .ts { color:var(--text-dim); }
+.log-entry .account { color:var(--accent); }
+.log-entry .tokens { color:var(--green); }
+
+.refresh-info { font-size:11px; color:var(--text-dim); }
+#error-banner { display:none; background:rgba(248,81,73,0.1); border:1px solid var(--red); color:var(--red); padding:8px 12px; border-radius:6px; margin-bottom:12px; font-size:12px; }
+
+.full-width { grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>anthropic-lb</h1>
+    <div class="status">
+      <span class="refresh-info">refreshes every 3s</span>
+      <span id="health-badge" class="badge badge-green">HEALTHY</span>
+      <span id="pii-badge" class="badge badge-orange">PII: --</span>
+      <span id="strategy-badge" class="badge badge-green">--</span>
+    </div>
+  </header>
+
+  <div id="error-banner"></div>
+
+  <!-- Overview stats -->
+  <div class="grid-3">
+    <div class="card">
+      <h2>Requests</h2>
+      <div class="stat"><span class="label">Total</span><span id="total-requests" class="value accent">0</span></div>
+      <div class="stat"><span class="label">Errors (429)</span><span id="total-429s" class="value red">0</span></div>
+      <div class="stat"><span class="label">Uptime</span><span id="uptime" class="value">--</span></div>
+    </div>
+    <div class="card">
+      <h2>Tokens</h2>
+      <div class="stat"><span class="label">Input</span><span id="total-in" class="value">0</span></div>
+      <div class="stat"><span class="label">Output</span><span id="total-out" class="value">0</span></div>
+      <div class="stat"><span class="label">Cache</span><span id="total-cache" class="value">0</span></div>
+    </div>
+    <div class="card">
+      <h2>PII Redaction</h2>
+      <div class="stat"><span class="label">Request PII</span><span id="pii-total" class="value orange">0</span></div>
+      <div class="stat"><span class="label">Response PII</span><span id="pii-response" class="value orange">0</span></div>
+      <div class="stat"><span class="label">Session Vault</span><span id="pii-global" class="value accent">0</span></div>
+      <div class="stat"><span class="label">Mode</span><span id="pii-mode" class="value">--</span></div>
+    </div>
+  </div>
+
+  <!-- Account cards -->
+  <div class="card" style="margin-bottom:16px;">
+    <h2>Accounts</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Account</th>
+          <th>Requests</th>
+          <th>Tokens In</th>
+          <th>Tokens Out</th>
+          <th>Cache</th>
+          <th>Capacity</th>
+          <th>5h Util</th>
+          <th>7d Util</th>
+          <th>429s</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="accounts-table"></tbody>
+    </table>
+  </div>
+
+  <!-- PII breakdown + test -->
+  <div class="grid">
+    <div class="card">
+      <h2>PII by Type</h2>
+      <div id="pii-by-type">
+        <div class="stat"><span class="label">No data yet</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>PII Test Sandbox</h2>
+      <div class="pii-test">
+        <textarea id="pii-input" placeholder="Paste text with PII to test detection...&#10;&#10;Example: Email john.doe@acme.com, call 555-123-4567, SSN: 123-45-6789">Email john.doe@acme.com about Q3 earnings. His SSN: 123-45-6789 and card 4111111111111111. Call 555-867-5309 or reach 192.168.1.100</textarea>
+        <button onclick="testPII()">Test PII Detection</button>
+        <div id="pii-result" class="pii-result"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Request log -->
+  <div class="card">
+    <h2>Recent Routing Decisions</h2>
+    <div id="routing-log" class="log">
+      <div class="log-entry"><span class="ts">waiting for requests...</span></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const routingLog = [];
+let prevStatus = null;
+
+function fmt(n) {
+  if (n === null || n === undefined) return '--';
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+  return String(n);
+}
+
+function pct(v) {
+  if (v === null || v === undefined) return '--';
+  return (v * 100).toFixed(1) + '%';
+}
+
+function barClass(v) {
+  if (v === null || v === undefined) return 'bar-green';
+  if (v > 0.8) return 'bar-red';
+  if (v > 0.5) return 'bar-orange';
+  return 'bar-green';
+}
+
+function fmtUptime(s) {
+  if (!s) return '--';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+async function refresh() {
+  try {
+    const resp = await fetch('/api/status');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+
+    document.getElementById('error-banner').style.display = 'none';
+    document.getElementById('health-badge').className = 'badge badge-green';
+    document.getElementById('health-badge').textContent = 'HEALTHY';
+
+    // Overview
+    let totalReq = 0, total429 = 0, totalIn = 0, totalOut = 0, totalCache = 0;
+    const accounts = data.accounts || {};
+    for (const [name, acct] of Object.entries(accounts)) {
+      totalReq += acct.requests || 0;
+      total429 += (acct['429_count'] || acct.errors_429 || 0);
+      totalIn += acct.tokens_in || 0;
+      totalOut += acct.tokens_out || 0;
+      totalCache += acct.tokens_cache_write || acct.tokens_cache || 0;
+    }
+    document.getElementById('total-requests').textContent = fmt(totalReq);
+    document.getElementById('total-429s').textContent = fmt(total429);
+    document.getElementById('total-in').textContent = fmt(totalIn);
+    document.getElementById('total-out').textContent = fmt(totalOut);
+    document.getElementById('total-cache').textContent = fmt(totalCache);
+    document.getElementById('uptime').textContent = fmtUptime(data.uptime_seconds || data.uptime);
+    document.getElementById('strategy-badge').textContent = data.strategy || '--';
+
+    // PII
+    const pii = data.pii || {};
+    document.getElementById('pii-total').textContent = fmt(pii.total_redacted || 0);
+    document.getElementById('pii-response').textContent = fmt(pii.response_redacted || 0);
+    document.getElementById('pii-mode').textContent = pii.mode || data.pii_mode || '--';
+    document.getElementById('pii-global').textContent = fmt(pii.global_mappings || 0);
+    document.getElementById('pii-badge').textContent = 'PII: ' + (pii.mode || data.pii_mode || '--');
+
+    // PII by type
+    const byType = pii.by_type || {};
+    const typeEl = document.getElementById('pii-by-type');
+    if (Object.keys(byType).length > 0) {
+      typeEl.innerHTML = Object.entries(byType).sort((a,b) => b[1]-a[1])
+        .map(([t,c]) => `<div class="stat"><span class="label">${t}</span><span class="value orange">${fmt(c)}</span></div>`)
+        .join('');
+    }
+
+    // Accounts table
+    const tbody = document.getElementById('accounts-table');
+    tbody.innerHTML = '';
+    for (const [name, acct] of Object.entries(accounts)) {
+      const cap = acct.unified_capacity ?? acct.capacity_score ?? null;
+      const u5h = acct.utilization_5h ?? null;
+      const u7d = acct.utilization_7d ?? null;
+      const cooldown = acct.cooldown_until ? (acct.cooldown_until - Date.now()/1000) : 0;
+      const status = cooldown > 0 ? 'COOLDOWN' : (acct.status === 'rejected' ? 'REJECTED' : 'OK');
+      const statusClass = status === 'OK' ? 'green' : 'red';
+
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="font-weight:600;color:var(--accent)">${name}</td>
+        <td>${fmt(acct.requests)}</td>
+        <td>${fmt(acct.tokens_in)}</td>
+        <td>${fmt(acct.tokens_out)}</td>
+        <td>${fmt(acct.tokens_cache_write || acct.tokens_cache || 0)}</td>
+        <td>
+          <div style="display:flex;align-items:center;gap:6px">
+            <div class="bar-container" style="width:60px"><div class="bar ${barClass(cap)}" style="width:${cap ? cap*100 : 0}%"></div></div>
+            <span>${pct(cap)}</span>
+          </div>
+        </td>
+        <td class="${u5h > 0.8 ? 'red' : u5h > 0.5 ? 'orange' : ''}">${pct(u5h)}</td>
+        <td class="${u7d > 0.8 ? 'red' : u7d > 0.5 ? 'orange' : ''}">${pct(u7d)}</td>
+        <td class="${(acct['429_count'] || acct.errors_429 || 0) > 0 ? 'red' : ''}">${acct['429_count'] || acct.errors_429 || 0}</td>
+        <td><span class="badge badge-${statusClass === 'green' ? 'green' : 'red'}">${status}</span></td>
+      `;
+      tbody.appendChild(tr);
+    }
+
+    // Detect routing changes for log
+    if (prevStatus) {
+      const prevAccounts = prevStatus.accounts || {};
+      for (const [name, acct] of Object.entries(accounts)) {
+        const prev = prevAccounts[name] || {};
+        const newReqs = (acct.requests || 0) - (prev.requests || 0);
+        if (newReqs > 0) {
+          const tokIn = (acct.tokens_in || 0) - (prev.tokens_in || 0);
+          const tokOut = (acct.tokens_out || 0) - (prev.tokens_out || 0);
+          routingLog.unshift({
+            ts: new Date().toLocaleTimeString(),
+            account: name,
+            requests: newReqs,
+            tokensIn: tokIn,
+            tokensOut: tokOut,
+          });
+          if (routingLog.length > 50) routingLog.length = 50;
+        }
+      }
+      const logEl = document.getElementById('routing-log');
+      if (routingLog.length > 0) {
+        logEl.innerHTML = routingLog.map(e =>
+          `<div class="log-entry"><span class="ts">${e.ts}</span> <span class="account">${e.account}</span> +${e.requests} req <span class="tokens">${fmt(e.tokensIn)} in / ${fmt(e.tokensOut)} out</span></div>`
+        ).join('');
+      }
+    }
+    prevStatus = data;
+
+  } catch (e) {
+    document.getElementById('error-banner').textContent = 'Connection lost: ' + e.message;
+    document.getElementById('error-banner').style.display = 'block';
+    document.getElementById('health-badge').className = 'badge badge-red';
+    document.getElementById('health-badge').textContent = 'OFFLINE';
+  }
+}
+
+async function testPII() {
+  const input = document.getElementById('pii-input').value;
+  const resultEl = document.getElementById('pii-result');
+  resultEl.style.display = 'block';
+  resultEl.textContent = 'Testing...';
+
+  try {
+    const resp = await fetch('/api/test-pii', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text: input}),
+    });
+    const data = await resp.json();
+
+    let html = '';
+    html += `<strong>PII Mode:</strong> ${data.pii_mode}\n`;
+    html += `<strong>Detections:</strong> ${data.pii_detected}\n`;
+    html += `<strong>Round-trip OK:</strong> ${data.round_trip_ok ? 'YES' : 'NO'}\n\n`;
+
+    html += `<strong>Anthropic sees:</strong>\n${escHtml(data.anthropic_sees)}\n\n`;
+    html += `<strong>Client sees:</strong>\n${escHtml(data.client_sees)}\n\n`;
+
+    if (data.detections && data.detections.length > 0) {
+      html += '<strong>Detections:</strong>\n';
+      for (const d of data.detections) {
+        html += `  <span class="pii-detection ${d.type}">${d.type}</span> ${escHtml(d.original)} -> ${escHtml(d.token)}\n`;
+      }
+    }
+    resultEl.innerHTML = html;
+  } catch (e) {
+    resultEl.textContent = 'Error: ' + e.message;
+  }
+}
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
+
+// Poll every 3s
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

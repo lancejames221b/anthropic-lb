@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.git/
+public/.git/
+keys.json
+.env
+.env.*
+pii-audit.log

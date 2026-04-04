@@ -1,0 +1,100 @@
+{
+    "_comment": "Synthetic PII pools for anthropic-lb. Loaded at startup. Do not include real PII.",
+    "first_names": [
+        "Aaron","Abigail","Adam","Aiden","Alan","Albert","Alexander","Alice","Amber","Amanda",
+        "Amy","Andrea","Andrew","Angela","Ann","Anna","Anthony","Arthur","Ashley","Austin",
+        "Barbara","Benjamin","Betty","Beverly","Billy","Bobby","Brandon","Brenda","Brian","Brittany",
+        "Bruce","Bryan","Carl","Carol","Carolyn","Catherine","Cheryl","Christian","Christina","Christine",
+        "Christopher","Charlotte","Cynthia","Daniel","Danielle","David","Deborah","Debra","Denise","Dennis",
+        "Diana","Diane","Donald","Donna","Doris","Dorothy","Douglas","Dylan","Edward","Elijah",
+        "Elizabeth","Emily","Emma","Eric","Ethan","Eugene","Evelyn","Frances","Frank","Fred",
+        "Gabriel","Gary","George","Gerald","Gloria","Grace","Gregory","Hannah","Harold","Harry",
+        "Heather","Helen","Henry","Howard","Isabella","Jack","Jacqueline","Jacob","Janice","Jason",
+        "Jean","Jeffrey","Jennifer","Jeremy","Jerry","Jesse","Jessica","Joan","John","Jonathan",
+        "Jose","Joseph","Joshua","Joyce","Judith","Judy","Julie","Justin","Karen","Katherine",
+        "Kathleen","Kathryn","Kayla","Keith","Kelly","Kenneth","Kevin","Kimberly","Larry","Laura",
+        "Lauren","Lawrence","Liam","Linda","Lisa","Logan","Lori","Louis","Luis","Madison",
+        "Margaret","Maria","Marie","Marilyn","Mark","Martha","Mary","Mason","Matthew","Megan",
+        "Melissa","Michael","Michelle","Nancy","Natalie","Nathan","Nicholas","Nicole","Noah","Olivia",
+        "Pamela","Patricia","Patrick","Paul","Peter","Philip","Rachel","Ralph","Raymond","Rebecca",
+        "Richard","Robert","Roger","Ronald","Roy","Russell","Ruth","Ryan","Samantha","Samuel",
+        "Sandra","Sara","Sarah","Scott","Sean","Sharon","Shirley","Sophia","Stephanie","Stephen",
+        "Steven","Susan","Teresa","Terry","Theresa","Thomas","Timothy","Tony","Tyler","Victor",
+        "Victoria","Virginia","Wayne","William","Willie","Zachary"
+    ],
+    "last_names": [
+        "Adams","Aguilar","Allen","Alvarez","Anderson","Andrews","Bailey","Baker","Barnes","Bell",
+        "Bennett","Berry","Bishop","Black","Boyd","Brooks","Brown","Bryant","Burke","Burns",
+        "Butler","Campbell","Carlson","Carter","Castillo","Chapman","Chavez","Clark","Cole","Coleman",
+        "Collins","Cook","Cooper","Cox","Cruz","Cunningham","Curtis","Davis","Diaz","Dixon",
+        "Douglas","Edwards","Ellis","Evans","Fields","Fisher","Flores","Ford","Foster","Fox",
+        "Freeman","Garcia","George","Gibson","Gomez","Gonzales","Gonzalez","Graham","Grant","Gray",
+        "Green","Griffin","Gutierrez","Hall","Hamilton","Harper","Harris","Hart","Hayes","Henderson",
+        "Hernandez","Herrera","Hill","Holmes","Howard","Hughes","Hunt","Jackson","James","Jenkins",
+        "Jimenez","Johnson","Jones","Jordan","Keller","Kelly","Kim","King","Knight","Lane",
+        "Lawrence","Lee","Lewis","Long","Lopez","Martin","Martinez","Matthews","Medina","Mendoza",
+        "Meyer","Miller","Mills","Mitchell","Montgomery","Moore","Morales","Moreno","Morgan","Morris",
+        "Murphy","Murray","Myers","Nelson","Nguyen","Olson","Ortiz","Owens","Palmer","Parker",
+        "Patel","Patterson","Perez","Perry","Peterson","Phillips","Powell","Price","Ramos","Ramirez",
+        "Reed","Reid","Reyes","Reynolds","Rice","Richardson","Riley","Rivera","Roberts","Robertson",
+        "Robinson","Rodriguez","Rogers","Rose","Ross","Ruiz","Russell","Sanchez","Sanders","Scott",
+        "Simmons","Smith","Soto","Spencer","Stevens","Stewart","Stone","Sullivan","Taylor","Thomas",
+        "Thompson","Torres","Tran","Turner","Vasquez","Wagner","Walker","Wallace","Ward","Watson",
+        "Weaver","Webb","Wells","West","White","Williams","Wilson","Wood","Wright","Young"
+    ],
+    "domains": [
+        "graniteworks.com","blueridgetech.net","northpointgroup.com","crestlineio.com",
+        "harborviewcorp.com","silverleafco.net","meridianpartners.com","ironbridgellc.com",
+        "cascadeinc.com","summitedge.net","keystonehq.com","tridentcorp.com",
+        "pinevalleygrp.com","redoakventures.com","clearwaterind.com","westgateltd.com",
+        "ridgelineops.com","beaconhill.net","atlasworkforce.com","novadynamic.com",
+        "cypressglobal.com","falconridge.net","helixtechnologies.com","orbitalinc.com",
+        "quartzdata.com","velocitech.com","apexlogic.com","stratfordmgmt.com",
+        "windwardcap.com","solarisenergy.com","titaniumhq.com","prismanalytics.net"
+    ],
+    "org_prefixes": [
+        "Apex","Aspen","Atlas","Axiom","Beacon","Borealis","Cascade","Catalyst","Cobalt","Crestview",
+        "Cypress","Denali","Drake","Eclipse","Ember","Evergreen","Falcon","Forge","Glacier","Granite",
+        "Graystone","Halo","Harbor","Helix","Horizon","Ionic","Ironwood","Ivory","Jade","Jupiter",
+        "Kestrel","Keystone","Kinetic","Lantern","Laurel","Lumen","Mercury","Meridian","Mosaic","Neptune",
+        "Nexus","Nordic","Northstar","Nova","Obsidian","Onyx","Opal","Orion","Pacific","Paladin",
+        "Phoenix","Pinnacle","Pioneer","Prism","Quantum","Quartz","Raven","Redwood","Ridgeline","Sapphire",
+        "Sequoia","Solaris","Sterling","Summit","Tempest","Titan","Trident","Unity","Uplift","Valor",
+        "Vanguard","Vector","Velocity","Vertex","Westgate","Windward","Xander","Yellowstone","Zenith","Zephyr"
+    ],
+    "org_suffixes": [
+        "Advisors","Aerospace","Alliance","Analytics","Associates","Biotech","Capital","Collective",
+        "Consulting","Corp","Development","Digital","Dynamics","Energy","Engineering","Enterprises",
+        "Financial","Global","Group","Holdings","Industries","Innovations","International","Labs",
+        "Logistics","Management","Medical","Networks","Partners","Pharma","Research","Robotics",
+        "Security","Services","Solutions","Strategies","Systems","Technologies","Trading","Ventures"
+    ],
+    "cities": [
+        "Arlington","Ashford","Ashland","Bayview","Bellwood","Brentwood","Bristol","Brookfield",
+        "Burlington","Carlton","Cedarville","Chester","Claremont","Clearwater","Dalton","Eastwood",
+        "Edgewater","Elmwood","Fairmont","Fairview","Foxwood","Franklin","Georgetown","Glendale",
+        "Grandview","Greenville","Hampton","Hartford","Hawthorne","Hillcrest","Irondale","Kingsport",
+        "Lakeside","Lakewood","Lancaster","Madison","Maplewood","Meadowbrook","Millbrook","Montclair",
+        "Newport","Northridge","Oakland","Oxford","Pinehurst","Portland","Preston","Richmond",
+        "Ridgewood","Riverside","Rockport","Rosewood","Silverdale","Southport","Springfield","Stonegate",
+        "Stratford","Sunnyvale","Thornton","Waverly","Westfield","Westport","Windsor","Woodbridge"
+    ],
+    "states": [
+        "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
+        "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+        "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT",
+        "VA","WA","WV","WI","WY"
+    ],
+    "streets": [
+        "Oak","Maple","Cedar","Pine","Elm","Main","Park","Lake","Hill","River",
+        "Spring","Meadow","Forest","Valley","Brook","Church","School","Mill","North","South",
+        "East","West","Bridge","Highland","Sunset","Ridge","Orchard","Cherry","Birch","Walnut",
+        "Chestnut","Willow","Laurel","Magnolia","Poplar","Sycamore","Hickory","Hazel","Aspen","Holly"
+    ],
+    "street_suffixes": ["St","Ave","Blvd","Dr","Rd","Ln","Ct","Way","Pl","Cir","Ter","Loop"],
+    "nationalities": [
+        "Canadian","Australian","British","German","French","Japanese","Brazilian","Italian",
+        "Swedish","Dutch","Korean","Mexican","Indian","Spanish","Portuguese","Norwegian",
+        "Danish","Finnish","Swiss","Austrian","Polish","Irish","Scottish","Welsh"
+    ]
+}

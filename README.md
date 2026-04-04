@@ -49,24 +49,35 @@ export ANTHROPIC_BASE_URL=http://localhost:8891
 Client: "Email john.doe@acme.com about Q3"
     |
     v
-anthropic-lb detects PII, tokenizes:
-    john.doe@acme.com -> __PII_EMAIL_a3f7b2c1__
+anthropic-lb detects PII, generates synthetic replacement:
+    john.doe@acme.com -> james.allen@example.net
     Stores mapping in per-request vault
     |
     v
-Anthropic sees: "Email __PII_EMAIL_a3f7b2c1__ about Q3"
+Anthropic sees: "Email james.allen@example.net about Q3"
     |
     v
-Response: "Drafted email to __PII_EMAIL_a3f7b2c1__..."
+Response: "Drafted email to james.allen@example.net..."
     |
     v
-Proxy detokenizes: __PII_EMAIL_a3f7b2c1__ -> john.doe@acme.com
+Proxy restores: james.allen@example.net -> john.doe@acme.com
     |
     v
 Client sees: "Drafted email to john.doe@acme.com..."
 ```
 
-The LLM never sees real PII. The client gets a fully restored response. The vault is in-memory only -- never persisted, never logged.
+The LLM never sees real PII -- it sees realistic-looking synthetic data instead of opaque tokens. This means the model can reason naturally about the data (it knows it's an email, a phone number, etc.) without ever seeing the actual values. The vault is in-memory only -- never persisted, never logged.
+
+Synthetic replacements are format-preserving:
+
+| Type | Real | Synthetic |
+|---|---|---|
+| Email | john.doe@acme.com | james.allen@example.net |
+| Phone | 555-867-5309 | 218-407-6997 |
+| SSN | SSN: 123-45-6789 | SSN: 840-20-7511 |
+| Credit Card | 4111111111111111 | 4000000472212606 |
+| IP Address | 192.168.1.100 | 10.121.33.19 |
+| API Key | sk-ant-api03-xxx... | sk-ant-REDACTED-a1b2c3d4 |
 
 ### Two Detection Tiers
 
@@ -204,6 +215,61 @@ Response headers on every proxied request:
 - **curl / httpie** -- direct HTTP calls
 
 The `x-api-key` header you send is replaced by the proxy. You can send any value or omit it entirely.
+
+## Docker
+
+Run the proxy and live dashboard in Docker without touching your host setup.
+
+```bash
+git clone https://github.com/lancejames221b/anthropic-lb.git
+cd anthropic-lb
+
+# Add your keys
+cp keys.json.example keys.json
+# Edit keys.json
+
+# Start proxy (port 9891) + dashboard (port 9892)
+docker compose up -d
+
+# Verify
+curl http://localhost:9891/health
+open http://localhost:9892   # dashboard
+```
+
+The dashboard shows live routing decisions, per-account capacity, PII redaction stats, and has a PII test sandbox.
+
+### Ports
+
+| Service | Default Port | Override |
+|---|---|---|
+| Proxy | 9891 | `LB_PORT=9891` |
+| Dashboard | 9892 | `DASHBOARD_PORT=9892` |
+
+### Environment
+
+```bash
+# All optional — defaults shown
+LB_PORT=9891            # Host port for proxy
+DASHBOARD_PORT=9892     # Host port for dashboard
+LB_PII=regex            # regex | presidio | off
+LB_PII_RESPONSE=detokenize  # detokenize | scan | off
+LB_STRATEGY=least-loaded    # least-loaded | round-robin
+```
+
+### With Presidio NER (optional)
+
+```bash
+INSTALL_PRESIDIO=true docker compose build
+LB_PII=presidio docker compose up -d
+```
+
+### Smoke Test
+
+```bash
+bash test-docker.sh
+```
+
+Tests health, status, PII detection, dashboard, and API routing.
 
 ## systemd Service
 
