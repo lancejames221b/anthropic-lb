@@ -99,6 +99,14 @@ ROUTING_W_7D = float(os.environ.get("ANTHROPIC_LB_W7D", "2.0"))
 ROUTING_TTL_5H_FULL = float(os.environ.get("ANTHROPIC_LB_TTL_5H", "1800"))    # 30 min
 ROUTING_TTL_7D_FULL = float(os.environ.get("ANTHROPIC_LB_TTL_7D", "86400"))   # 24 h
 
+# Backpressure — queue requests when all accounts are hot (Issue #10)
+# Disabled by default (threshold > 1.0 means never triggers). Set to 0.9 to enable.
+BACKPRESSURE_THRESHOLD = float(os.environ.get("ANTHROPIC_LB_BACKPRESSURE", "1.1"))
+BACKPRESSURE_QUEUE_TIMEOUT = float(os.environ.get("ANTHROPIC_LB_QUEUE_TIMEOUT", "30"))
+_backpressure_queue_depth = 0
+_backpressure_total_queued = 0
+_backpressure_total_timeouts = 0
+
 # PII configuration
 PII_MODE = os.environ.get("ANTHROPIC_LB_PII", "off").lower()          # regex | presidio | off
 PII_RESPONSE = os.environ.get("ANTHROPIC_LB_PII_RESPONSE", "detokenize").lower()  # detokenize | scan | off
@@ -2969,11 +2977,83 @@ def pick_account():
     return pick_account_least_loaded()
 
 
+def _all_accounts_above_threshold() -> bool:
+    """Return True if every account is above the backpressure utilization threshold."""
+    if BACKPRESSURE_THRESHOLD > 1.0:
+        return False  # Backpressure disabled
+    now = time.time()
+    for name in KEY_NAMES:
+        s = STATS[name]
+        # Skip accounts in hard 429 cooldown
+        if s["rate_limited_until"] > now:
+            continue
+        # Check unified utilization (OAuth accounts)
+        util_5h = s["unified_5h_utilization"] or 0.0
+        util_7d = s["unified_7d_utilization"] or 0.0
+        worst = max(util_5h, util_7d)
+        if worst < BACKPRESSURE_THRESHOLD:
+            return False
+    return True
+
+
+async def _backpressure_wait() -> bool:
+    """Wait for capacity to free up. Returns True if capacity found, False on timeout."""
+    global _backpressure_queue_depth, _backpressure_total_queued, _backpressure_total_timeouts
+    _backpressure_queue_depth += 1
+    _backpressure_total_queued += 1
+    start = time.time()
+    poll_interval = 1.0  # Start at 1s, backoff up to 4s
+    try:
+        while time.time() - start < BACKPRESSURE_QUEUE_TIMEOUT:
+            await asyncio.sleep(poll_interval)
+            if not _all_accounts_above_threshold():
+                logger.info(
+                    "[BACKPRESSURE] released after %.1fs queue_depth=%d",
+                    time.time() - start, _backpressure_queue_depth,
+                )
+                return True
+            poll_interval = min(poll_interval * 1.5, 4.0)
+        # Timeout
+        _backpressure_total_timeouts += 1
+        logger.warning(
+            "[BACKPRESSURE] timeout after %.1fs queue_depth=%d",
+            time.time() - start, _backpressure_queue_depth,
+        )
+        return False
+    finally:
+        _backpressure_queue_depth -= 1
+
+
 # ---------------------------------------------------------------------------
 # Main proxy handler — now with PII redaction/detokenization
 # ---------------------------------------------------------------------------
 
 async def proxy_handler(request: web.Request) -> web.StreamResponse:
+    # ------------------------------------------------------------------
+    # Backpressure — queue request if all accounts are hot (Issue #10)
+    # ------------------------------------------------------------------
+    queued_seconds = 0.0
+    if _all_accounts_above_threshold():
+        bp_start = time.time()
+        capacity_found = await _backpressure_wait()
+        queued_seconds = time.time() - bp_start
+        if not capacity_found:
+            return web.Response(
+                body=json.dumps({
+                    "error": "all_accounts_saturated",
+                    "message": "All accounts above utilization threshold. Request queued but timed out.",
+                    "queued_seconds": round(queued_seconds, 1),
+                    "queue_timeout": BACKPRESSURE_QUEUE_TIMEOUT,
+                }).encode(),
+                status=503,
+                content_type="application/json",
+                headers={
+                    "X-LB-Queued": f"{queued_seconds:.1f}",
+                    "Retry-After": "30",
+                },
+            )
+    # ------------------------------------------------------------------
+
     name, api_key = pick_account()
     STATS[name]["requests"] += 1
     STATS[name]["last_used"] = time.time()
@@ -3096,6 +3176,8 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                 continue
             resp_headers[k] = v
         resp_headers["X-LB-Account"] = name
+        if queued_seconds > 0:
+            resp_headers["X-LB-Queued"] = f"{queued_seconds:.1f}"
 
         # Add PII redaction count header
         if vault.count > 0:
@@ -3247,6 +3329,14 @@ async def status_handler(request: web.Request) -> web.Response:
             "tokens_in": total_in,
             "tokens_out": total_out,
             "tokens_total": total_in + total_out,
+        },
+        "backpressure": {
+            "enabled": BACKPRESSURE_THRESHOLD <= 1.0,
+            "threshold": BACKPRESSURE_THRESHOLD if BACKPRESSURE_THRESHOLD <= 1.0 else None,
+            "queue_timeout_seconds": BACKPRESSURE_QUEUE_TIMEOUT,
+            "current_queue_depth": _backpressure_queue_depth,
+            "total_queued": _backpressure_total_queued,
+            "total_timeouts": _backpressure_total_timeouts,
         },
         "accounts": accounts,
         # PII statistics (always included; zeroes when PII_MODE=off)
