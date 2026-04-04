@@ -124,11 +124,13 @@ def _build_builtin_patterns():
         None,
     ))
 
-    # US Social Security Numbers  (XXX-XX-XXXX)
+    # US Social Security Numbers — context-required to avoid false positives
+    # Only matches XXX-XX-XXXX when preceded by SSN-related keywords
     patterns.append((
         "ssn",
         re.compile(
-            r'\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b',
+            r'(?i)(?:ssn|social\s+security(?:\s+number)?|ss#|soc\s*sec)\s*[:#]?\s*'
+            r'(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b',
         ),
         "SSN",
         None,
