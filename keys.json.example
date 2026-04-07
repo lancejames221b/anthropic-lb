@@ -1,5 +1,5 @@
 {
-    "_comment": "Both formats supported — simple strings or objects with limits",
+    "_comment": "Both formats supported — simple strings or objects with limits/affinity",
 
     "simple-account": "sk-ant-api03-your-key-here",
 
@@ -9,7 +9,20 @@
             "rpm": 4000,
             "itpm": 400000,
             "otpm": 80000
-        }
+        },
+        "affinity": ["cursor", "interactive"],
+        "priority": 1
+    },
+
+    "batch-account": {
+        "key": "sk-ant-oat01-your-other-key-here",
+        "limits": {
+            "rpm": 4000,
+            "itpm": 400000,
+            "otpm": 80000
+        },
+        "affinity": ["openclaw", "cron", "batch"],
+        "priority": 2
     },
 
     "api-key-tier1": {

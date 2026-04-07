@@ -55,6 +55,8 @@ import sys
 import time
 import logging
 from collections import defaultdict, deque
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiohttp import web, ClientSession, ClientTimeout
 
@@ -106,6 +108,17 @@ BACKPRESSURE_QUEUE_TIMEOUT = float(os.environ.get("ANTHROPIC_LB_QUEUE_TIMEOUT", 
 _backpressure_queue_depth = 0
 _backpressure_total_queued = 0
 _backpressure_total_timeouts = 0
+
+# Budget throttle — soft cap on 5h utilization before routing degrades (Issue #15)
+# At this threshold, score gets a steep penalty. At 1.0 Anthropic rejects outright.
+BUDGET_5H_THRESHOLD = float(os.environ.get("ANTHROPIC_LB_BUDGET_5H", "0.6"))
+
+# Peak-hour penalty — Anthropic shrinks quotas during 05:00-11:00 PT (March 2026)
+# Multiplier applied to capacity scores during peak hours (0.6 = 40% penalty)
+PEAK_HOUR_PENALTY = float(os.environ.get("ANTHROPIC_LB_PEAK_PENALTY", "0.6"))
+PEAK_HOUR_START = int(os.environ.get("ANTHROPIC_LB_PEAK_START", "5"))   # hour in PT
+PEAK_HOUR_END   = int(os.environ.get("ANTHROPIC_LB_PEAK_END", "11"))   # hour in PT
+_TZ_PT = ZoneInfo("America/Los_Angeles")
 
 # PII configuration
 PII_MODE = os.environ.get("ANTHROPIC_LB_PII", "off").lower()          # regex | presidio | off
@@ -2474,37 +2487,51 @@ def load_keys():
     Simple format (backwards compatible):
         {"account-name": "sk-ant-..."}
 
-    Extended format (with rate limit configuration):
+    Extended format (with rate limit configuration and consumer affinity):
         {
             "account-name": {
                 "key": "sk-ant-...",
-                "limits": {"rpm": 50, "tpm": 40000, "tpd": 1000000}
+                "limits": {"rpm": 50, "tpm": 40000, "tpd": 1000000},
+                "affinity": ["cursor", "interactive"],
+                "priority": 1
             }
         }
 
+    Consumer affinity (Issue #15): when set, an account is preferred for
+    requests whose X-LB-Consumer header matches one of the affinity tags.
+    Priority (1=highest) controls preference order within affinity matches.
+
     Returns:
-        (keys_dict, limits_dict) where limits_dict may be empty.
+        (keys_dict, limits_dict, affinity_dict, priority_dict)
     """
     keys = {}
     limits = {}
+    affinity = {}
+    priority = {}
 
     if os.path.exists(KEYS_FILE):
         with open(KEYS_FILE) as f:
             raw = json.load(f)
         if raw:
             for name, value in raw.items():
+                if name.startswith("_"):
+                    continue
                 if isinstance(value, str):
-                    # Simple format
                     keys[name] = value
                 elif isinstance(value, dict):
-                    # Extended format
                     key = value.get("key", "")
                     if key:
                         keys[name] = key
                     if "limits" in value:
                         limits[name] = value["limits"]
+                    if "affinity" in value:
+                        affinity[name] = value["affinity"]
+                    if "priority" in value:
+                        priority[name] = value["priority"]
             if keys:
-                return keys, limits
+                if affinity:
+                    logger.info("[CONFIG] consumer_affinity=%s", affinity)
+                return keys, limits, affinity, priority
 
     i = 1
     while True:
@@ -2520,10 +2547,10 @@ def load_keys():
         print(f"  Create {KEYS_FILE} or set ANTHROPIC_KEY_1, ANTHROPIC_KEY_2, ...", file=sys.stderr)
         sys.exit(1)
 
-    return keys, limits
+    return keys, limits, affinity, priority
 
 
-KEYS, ACCOUNT_LIMITS = load_keys()
+KEYS, ACCOUNT_LIMITS, CONSUMER_AFFINITY, ACCOUNT_PRIORITY = load_keys()
 KEY_NAMES = list(KEYS.keys())
 KEY_CYCLE = itertools.cycle(range(len(KEY_NAMES)))
 START_TIME = time.time()
@@ -2648,12 +2675,14 @@ def update_token_usage(name, body_bytes):
         s = STATS[name]
         inp = usage.get("input_tokens", 0)
         out = usage.get("output_tokens", 0)
+        cache_read = usage.get("cache_read_input_tokens", 0)
+        cache_write = usage.get("cache_creation_input_tokens", 0)
         s["tokens_in"] += inp
         s["tokens_out"] += out
-        s["tokens_cache_read"] += usage.get("cache_read_input_tokens", 0)
-        s["tokens_cache_write"] += usage.get("cache_creation_input_tokens", 0)
-        # Record in sliding window for capacity scoring (Issue #6)
+        s["tokens_cache_read"] += cache_read
+        s["tokens_cache_write"] += cache_write
         _window_tracker.record_request(name, inp + out)
+        _log_cache_ratio(name, inp, out, cache_read, cache_write)
     except (json.JSONDecodeError, AttributeError):
         pass
 
@@ -2661,6 +2690,10 @@ def update_token_usage(name, body_bytes):
 def update_stream_usage(name, chunks):
     """Extract token usage from SSE stream (message_delta event has usage)."""
     total_tokens = 0
+    stream_inp = 0
+    stream_out = 0
+    stream_cache_read = 0
+    stream_cache_write = 0
     try:
         for chunk in chunks:
             if b'"type":"message_delta"' in chunk or b'"type": "message_delta"' in chunk:
@@ -2671,6 +2704,7 @@ def update_stream_usage(name, chunks):
                         s = STATS[name]
                         out = usage.get("output_tokens", 0)
                         s["tokens_out"] += out
+                        stream_out += out
                         total_tokens += out
             if b'"type":"message_start"' in chunk or b'"type": "message_start"' in chunk:
                 for line in chunk.split(b"\n"):
@@ -2679,19 +2713,56 @@ def update_stream_usage(name, chunks):
                         usage = data.get("message", {}).get("usage", {})
                         s = STATS[name]
                         inp = usage.get("input_tokens", 0)
+                        cr = usage.get("cache_read_input_tokens", 0)
+                        cw = usage.get("cache_creation_input_tokens", 0)
                         s["tokens_in"] += inp
-                        s["tokens_cache_read"] += usage.get("cache_read_input_tokens", 0)
-                        s["tokens_cache_write"] += usage.get("cache_creation_input_tokens", 0)
+                        s["tokens_cache_read"] += cr
+                        s["tokens_cache_write"] += cw
+                        stream_inp += inp
+                        stream_cache_read += cr
+                        stream_cache_write += cw
                         total_tokens += inp
     except (json.JSONDecodeError, AttributeError, KeyError):
         pass
-    # Record in sliding window for capacity scoring (Issue #6)
     if total_tokens > 0:
         _window_tracker.record_request(name, total_tokens)
+        _log_cache_ratio(name, stream_inp, stream_out, stream_cache_read, stream_cache_write)
 
 
 # ---------------------------------------------------------------------------
-# Account selection (unchanged)
+# Cache ratio logging + peak-hour detection
+# ---------------------------------------------------------------------------
+
+def _log_cache_ratio(name: str, inp: int, out: int, cache_read: int, cache_write: int):
+    """Log cache_read vs actual I/O ratio to detect cache inflation (Issue #15)."""
+    io_total = inp + out
+    if io_total == 0 and cache_read == 0:
+        return
+    all_tokens = io_total + cache_read + cache_write
+    if all_tokens == 0:
+        return
+    cache_pct = (cache_read / all_tokens) * 100.0 if all_tokens else 0.0
+    if cache_pct > 90.0:
+        logger.warning(
+            "[CACHE-RATIO] account=%s cache_read=%d io=%d cache_write=%d ratio=%.1f%% "
+            "ALERT: cache reads dominating quota",
+            name, cache_read, io_total, cache_write, cache_pct,
+        )
+    elif cache_read > 0:
+        logger.info(
+            "[CACHE-RATIO] account=%s cache_read=%d io=%d cache_write=%d ratio=%.1f%%",
+            name, cache_read, io_total, cache_write, cache_pct,
+        )
+
+
+def _is_peak_hour() -> bool:
+    """Return True if current time is within Anthropic peak hours (PT)."""
+    pt_hour = datetime.now(_TZ_PT).hour
+    return PEAK_HOUR_START <= pt_hour < PEAK_HOUR_END
+
+
+# ---------------------------------------------------------------------------
+# Account selection
 # ---------------------------------------------------------------------------
 
 def _compute_unified_score(name: str, s: dict, now: float) -> tuple[float, dict] | None:
@@ -2748,6 +2819,25 @@ def _compute_unified_score(name: str, s: dict, now: float) -> tuple[float, dict]
     if s["unified_status"] == "allowed_warning":
         base_score *= 0.7
 
+    # --- Budget threshold (Issue #15) ---
+    # Steep penalty when 5h utilization exceeds the budget threshold.
+    # This prevents routing to accounts that are on track to exhaust their window.
+    if util_5h >= BUDGET_5H_THRESHOLD:
+        overage = (util_5h - BUDGET_5H_THRESHOLD) / (1.0 - BUDGET_5H_THRESHOLD)
+        budget_penalty = overage * 0.5  # up to 50% penalty as util approaches 1.0
+        base_score *= (1.0 - budget_penalty)
+        logger.debug(
+            "[ROUTE] budget_penalty account=%s util_5h=%.2f threshold=%.2f penalty=%.2f",
+            name, util_5h, BUDGET_5H_THRESHOLD, budget_penalty,
+        )
+
+    # --- Peak-hour penalty (Issue #15) ---
+    # Anthropic shrinks quotas during 05:00-11:00 PT. Apply multiplier to
+    # conserve capacity when we know the window is effectively smaller.
+    peak = _is_peak_hour()
+    if peak:
+        base_score *= PEAK_HOUR_PENALTY
+
     # --- Velocity penalty (Issue #13) ---
     # Only apply if rpm explicitly configured (OAuth accounts have no hard RPM cap)
     lims = ACCOUNT_LIMITS.get(name, {})
@@ -2780,19 +2870,23 @@ def _compute_unified_score(name: str, s: dict, now: float) -> tuple[float, dict]
         "effective_7d": round(effective_7d, 3),
         "weighted_util": round(weighted_util, 3),
         "velocity_penalty": round(velocity_penalty, 3),
+        "budget_5h_threshold": BUDGET_5H_THRESHOLD,
+        "budget_over": util_5h >= BUDGET_5H_THRESHOLD,
+        "peak_hour": peak,
+        "peak_penalty": PEAK_HOUR_PENALTY if peak else 1.0,
         "w_5h": ROUTING_W_5H,
         "w_7d": ROUTING_W_7D,
     }
 
     logger.debug(
-        "[ROUTE] score account=%s score=%.3f 5h=%.2f(x%.2f) 7d=%.2f(x%.2f) vel=%.3f status=%s",
+        "[ROUTE] score account=%s score=%.3f 5h=%.2f(x%.2f) 7d=%.2f(x%.2f) vel=%.3f peak=%s status=%s",
         name, base_score, util_5h, leniency_5h, util_7d, leniency_7d,
-        velocity_penalty, s["unified_status"],
+        velocity_penalty, peak, s["unified_status"],
     )
     return max(0.0, base_score), breakdown
 
 
-def pick_account_least_loaded():
+def pick_account_least_loaded(consumer: str = ""):
     """Pick the account with the highest capacity score.
 
     Scoring priority:
@@ -2801,6 +2895,7 @@ def pick_account_least_loaded():
     3. Standard API key with headers: normalize remaining/limit
     4. Configured limits in keys.json: headroom from sliding window
     5. Fallback to least-used heuristic when no data exists
+    6. Consumer affinity boost for accounts tagged for this consumer (Issue #15)
     """
     now = time.time()
     available = [n for n in KEY_NAMES if STATS[n]["rate_limited_until"] <= now]
@@ -2865,10 +2960,38 @@ def pick_account_least_loaded():
         scored.append((name, score))
 
     if not scored:
-        # All accounts appear saturated — pick first available anyway
-        best = available[0]
-        logger.warning(f"[ROUTE] all_saturated fallback account={best}")
+        # All accounts appear saturated — pick the one with lowest utilization
+        def _util_key(n):
+            s = STATS[n]
+            u5 = s.get("unified_5h_utilization") or 0.0
+            u7 = s.get("unified_7d_utilization") or 0.0
+            return (u5 * ROUTING_W_5H + u7 * ROUTING_W_7D) / (ROUTING_W_5H + ROUTING_W_7D)
+        best = min(available, key=_util_key) if available else KEY_NAMES[0]
+        logger.warning(
+            "[ROUTE] all_saturated fallback account=%s util_5h=%.2f util_7d=%.2f",
+            best,
+            STATS[best].get("unified_5h_utilization") or 0.0,
+            STATS[best].get("unified_7d_utilization") or 0.0,
+        )
         return best, KEYS[best]
+
+    # --- Consumer affinity boost (Issue #15) ---
+    # If caller identified itself, boost scores for accounts with matching affinity.
+    if consumer and CONSUMER_AFFINITY:
+        boosted = []
+        for acct_name, score in scored:
+            tags = CONSUMER_AFFINITY.get(acct_name, [])
+            if consumer in tags:
+                prio = ACCOUNT_PRIORITY.get(acct_name, 5)
+                boost = max(0.01, 0.2 / prio)
+                boosted.append((acct_name, min(1.0, score + boost)))
+                logger.debug(
+                    "[ROUTE] affinity_boost account=%s consumer=%s boost=+%.3f",
+                    acct_name, consumer, boost,
+                )
+            else:
+                boosted.append((acct_name, score))
+        scored = boosted
 
     best_name, best_score = max(scored, key=lambda x: x[1])
     lims = ACCOUNT_LIMITS.get(best_name, {})
@@ -2971,10 +3094,10 @@ async def _oauth_usage_poll_loop():
             await asyncio.sleep(60)
 
 
-def pick_account():
+def pick_account(consumer: str = ""):
     if STRATEGY == "round-robin":
         return pick_account_round_robin()
-    return pick_account_least_loaded()
+    return pick_account_least_loaded(consumer=consumer)
 
 
 def _all_accounts_above_threshold() -> bool:
@@ -3054,7 +3177,8 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
             )
     # ------------------------------------------------------------------
 
-    name, api_key = pick_account()
+    consumer = request.headers.get("X-LB-Consumer", "").lower().strip()
+    name, api_key = pick_account(consumer=consumer)
     STATS[name]["requests"] += 1
     STATS[name]["last_used"] = time.time()
 
@@ -3065,7 +3189,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     headers = {}
     for k, v in request.headers.items():
         kl = k.lower()
-        if kl in ("host", "content-length", "transfer-encoding"):
+        if kl in ("host", "content-length", "transfer-encoding", "x-lb-consumer"):
             continue
         headers[k] = v
     # Set auth using shared helper
@@ -3108,7 +3232,23 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
 
             while True:
                 ra_hdr = resp.headers.get("retry-after")
-                cooldown = int(ra_hdr) if ra_hdr and ra_hdr.isdigit() else 60
+                raw_cooldown = int(ra_hdr) if ra_hdr and ra_hdr.isdigit() else 60
+
+                # For OAuth accounts: cap cooldown based on unified utilization.
+                # If the account has low utilization, the 429 was a transient burst
+                # limit -- don't lock it out for 48 minutes.
+                is_oauth_acct = KEYS[name].startswith("sk-ant-oat")
+                util_5h = STATS[name].get("unified_5h_utilization") or 0.0
+                if is_oauth_acct and util_5h < 0.9:
+                    # Low/moderate utilization: cap at 30s (transient burst)
+                    cooldown = min(raw_cooldown, 30)
+                elif is_oauth_acct and util_5h < 1.0:
+                    # High but not maxed: cap at 120s
+                    cooldown = min(raw_cooldown, 120)
+                else:
+                    # Non-OAuth or fully saturated: respect header, but cap at 5 min
+                    cooldown = min(raw_cooldown, 300)
+
                 last_retry_after = cooldown
                 STATS[name]["errors"] += 1
                 STATS[name]["rate_limit_hits"] += 1
@@ -3290,6 +3430,11 @@ async def status_handler(request: web.Request) -> web.Response:
                 "cache_read": s["tokens_cache_read"],
                 "cache_write": s["tokens_cache_write"],
                 "total": s["tokens_in"] + s["tokens_out"],
+                "cache_ratio_pct": round(
+                    (s["tokens_cache_read"] /
+                     max(1, s["tokens_in"] + s["tokens_out"] + s["tokens_cache_read"] + s["tokens_cache_write"])
+                    ) * 100, 1
+                ),
             },
             "rate_limits": {
                 # Standard API key fields
@@ -3338,6 +3483,13 @@ async def status_handler(request: web.Request) -> web.Response:
             "total_queued": _backpressure_total_queued,
             "total_timeouts": _backpressure_total_timeouts,
         },
+        "budget": {
+            "threshold_5h": BUDGET_5H_THRESHOLD,
+            "peak_hour_penalty": PEAK_HOUR_PENALTY,
+            "peak_hours_pt": f"{PEAK_HOUR_START:02d}:00-{PEAK_HOUR_END:02d}:00",
+            "is_peak_now": _is_peak_hour(),
+        },
+        "consumer_affinity": CONSUMER_AFFINITY or None,
         "accounts": accounts,
         # PII statistics (always included; zeroes when PII_MODE=off)
         "pii": {

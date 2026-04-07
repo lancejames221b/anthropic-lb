@@ -16,7 +16,7 @@ services:
       - lb-logs:/app/logs
       - lb-vault:/app/vault
     environment:
-      - ANTHROPIC_LB_PII=${LB_PII:-regex}
+      - ANTHROPIC_LB_PII=${LB_PII:-off}
       - ANTHROPIC_LB_PII_RESPONSE=${LB_PII_RESPONSE:-detokenize}
       - ANTHROPIC_LB_STRATEGY=${LB_STRATEGY:-least-loaded}
       - ANTHROPIC_LB_PII_AUDIT_LOG=/app/logs/pii-audit.log
